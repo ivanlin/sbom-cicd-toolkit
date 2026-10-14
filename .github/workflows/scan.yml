@@ -1,7 +1,7 @@
 # Reusable SBOM + CVE gate. Call it from any repo:
 #   jobs:
 #     gate:
-#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.0.0
+#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.0.1
 #       with:
 #         name: my-project
 #         source: .
@@ -27,7 +27,7 @@ on:
         default: false
       toolkit_image:
         type: string
-        default: "ghcr.io/ivanlin/sbom-cicd-toolkit:1.0.0"
+        default: "ghcr.io/ivanlin/sbom-cicd-toolkit:1.0.1"
     outputs:
       result:
         value: ${{ jobs.gate.outputs.result }}
