@@ -196,7 +196,9 @@ cmd_scan() {
       '. + [{kind:$k, cyclonedx:{file:$c, spec:$cv, components:$nc}, spdx:{file:$s, spec:$sv, packages:$ns}}]' <<<"$sboms")"
     log "grype: $kind ($(jq '.components|length' "$cdx") components)"
     # shellcheck disable=SC2086
-    grype "sbom:$(wpath "$cdx")" -q -o json --file "$(wpath "$OUT/scan/grype.$kind.json")" -c "$(wpath "$GRYPE_CFG")" $of
+    grype "sbom:$(wpath "$cdx")" -q -o json --file "$(wpath "$OUT/scan/grype.$kind.json")" -c "$(wpath "$GRYPE_CFG")" $of \
+      || die "grype exited $? on $kind SBOM (vulnerability DB download or match failure — see messages above; check disk space and network)"
+    [ -s "$OUT/scan/grype.$kind.json" ] || die "grype produced no output for $kind SBOM ($OUT/scan/grype.$kind.json is empty)"
     jq --arg k "$kind" '[ .matches[] | {id:.vulnerability.id, severity:(.vulnerability.severity|ascii_upcase),
         package:.artifact.name, version:.artifact.version, type:.artifact.type,
         fixed_in:((.vulnerability.fix.versions // [])|join(", ")), fix_state:(.vulnerability.fix.state // "unknown"),
@@ -205,7 +207,9 @@ cmd_scan() {
       "$OUT/scan/grype.$kind.json" > "$OUT/gate/meta.grype.$kind.json"
     if [ "$NO_TRIVY" = 0 ]; then
       log "trivy: $kind"
-      trivy sbom "$(wpath "$cdx")" -q --format json --output "$(wpath "$OUT/scan/trivy.$kind.json")" --scanners vuln
+      trivy sbom "$(wpath "$cdx")" -q --format json --output "$(wpath "$OUT/scan/trivy.$kind.json")" --scanners vuln \
+        || die "trivy exited $? on $kind SBOM (vulnerability DB download or scan failure — see messages above)"
+      [ -s "$OUT/scan/trivy.$kind.json" ] || die "trivy produced no output for $kind SBOM"
       jq --arg k "$kind" '[ (.Results // [])[] | (.Vulnerabilities // [])[] | {id:.VulnerabilityID, severity:(.Severity|ascii_upcase),
           package:.PkgName, version:.InstalledVersion, fixed_in:(.FixedVersion // ""), kind:$k, scanner:"trivy"} ] | unique_by(.id,.package,.version)' \
           "$OUT/scan/trivy.$kind.json" > "$OUT/gate/norm.trivy.$kind.json"
