@@ -7,6 +7,37 @@ name: sbom-cve-gate (reusable)
 on:
   workflow_call:
     inputs:
+      name:
+        type: string
+        required: true
+        description: "SBOM / artifact name"
+      source:
+        type: string
+        default: "."
+        description: "directory to scan, repo-relative"
+      fail_on:
+        type: string
+        default: "CRITICAL"
+        description: "CRITICAL | HIGH | MEDIUM | LOW | none"
+      only_fixed:
+        type: boolean
+        default: false
+      toolkit_image:
+        type: string
+        default: "ghcr.io/ivanlin/sbom-cicd-toolkit:1.0.0"
+    outputs:
+      result:
+        value: ${{ jobs.gate.outputs.result }}
+      toolkit_digest:
+        value: ${{ jobs.gate.outputs.digest }}
+jobs:
+#     gate:
+#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.0.0
+#       with: { name: my-project, source: ., fail_on: CRITICAL }
+name: sbom-cve-gate (reusable)
+on:
+  workflow_call:
+    inputs:
       name:          { type: string,  required: true,  description: "SBOM / artifact name" }
       source:        { type: string,  default: ".",    description: "directory to scan, repo-relative" }
       fail_on:       { type: string,  default: "CRITICAL", description: "CRITICAL | HIGH | MEDIUM | LOW | none" }
@@ -14,7 +45,7 @@ on:
       toolkit_image: { type: string,  default: "ghcr.io/ivanlin/sbom-cicd-toolkit:1.0.0" }
     outputs:
       result:        { value: ${{ jobs.gate.outputs.result }} }
-      toolkit_digest:{ value: ${{ jobs.gate.outputs.digest }} }
+      toolkit_digest: { value: ${{ jobs.gate.outputs.digest }} }
 jobs:
   gate:
     runs-on: ubuntu-latest
