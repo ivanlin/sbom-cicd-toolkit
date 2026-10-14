@@ -1,0 +1,85 @@
+# Platform x architecture verification. Every job runs the SAME two fixtures and asserts
+# vuln-app -> exit 2 (gate FAIL) and clean-app -> exit 0 (gate PASS).
+# HONESTY: "container" jobs run the Linux image; "native" jobs run the pinned binaries directly on
+# the runner OS. GitHub's Windows and macOS runners cannot run Linux containers, so there is no
+# container job for them — see the windows-container-check job.
+name: platform-matrix
+on:
+  push: { branches: [ main ] }
+  pull_request:
+  workflow_dispatch:
+permissions: { contents: read }
+jobs:
+  container-linux-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker buildx build --platform linux/amd64 --build-arg TOOLKIT_VERSION="$(cat VERSION)" --build-arg VCS_REF="$GITHUB_SHA" -t toolkit:ci --load .
+      - run: scripts/fixtures-container.sh toolkit:ci "github-actions/ubuntu-latest/linux-amd64/container" out
+      - run: jq . out/result.json >> "$GITHUB_STEP_SUMMARY" && echo >> "$GITHUB_STEP_SUMMARY" && cat out/vuln/summary.md >> "$GITHUB_STEP_SUMMARY"
+        if: always()
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: matrix-container-linux-amd64, path: out }
+  container-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker buildx build --platform linux/arm64 --build-arg TOOLKIT_VERSION="$(cat VERSION)" --build-arg VCS_REF="$GITHUB_SHA" -t toolkit:ci --load .
+      - run: scripts/fixtures-container.sh toolkit:ci "github-actions/ubuntu-24.04-arm/linux-arm64/container" out
+      - run: jq . out/result.json >> "$GITHUB_STEP_SUMMARY"
+        if: always()
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: matrix-container-linux-arm64, path: out }
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  label: "github-actions/ubuntu-latest/linux-amd64/native" }
+          - { os: macos-latest,   label: "github-actions/macos-latest/macos-arm64/native" }
+          - { os: macos-15-intel, label: "github-actions/macos-15-intel/macos-amd64/native" }
+          - { os: windows-latest, label: "github-actions/windows-latest/windows-amd64/native(git-bash)" }
+    runs-on: ${{ matrix.os }}
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned tools natively (same tools.lock as the image)
+        run: bash install/native-install.sh --prefix "$RUNNER_TEMP/tk"
+      - name: Fixtures
+        run: |
+          export PATH="$RUNNER_TEMP/tk/bin:$PATH" SBOMGATE_HOME="$RUNNER_TEMP/tk"
+          scripts/fixtures-native.sh "${{ matrix.label }}" out
+      - run: jq . out/result.json >> "$GITHUB_STEP_SUMMARY"
+        if: always()
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "matrix-native-${{ matrix.os }}", path: out }
+  windows-powershell-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell installer (verifies sha256, same tools.lock)
+        shell: pwsh
+        run: ./install/native-install.ps1 -Prefix "$env:RUNNER_TEMP\tk2"
+      - name: Fixtures via Git Bash using the PowerShell-installed binaries
+        shell: bash
+        run: |
+          tk="$(cygpath -u "$RUNNER_TEMP")/tk2"; export PATH="$tk/bin:$PATH" SBOMGATE_HOME="$tk"
+          scripts/fixtures-native.sh "github-actions/windows-latest/windows-amd64/native(pwsh-install)" out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: matrix-native-windows-pwsh, path: out }
+  windows-container-check:
+    # Evidence, not a scan: the Windows runner's Docker daemon is in Windows-container mode, so the
+    # Linux toolkit image cannot run here. This job records that fact instead of pretending.
+    runs-on: windows-latest
+    steps:
+      - shell: bash
+        run: |
+          mkdir -p out; { echo "runner: windows-latest"; docker version --format '{{json .}}' 2>&1 | head -c 2000; echo; echo "daemon OSType: $(docker info --format '{{.OSType}}' 2>&1)"; } | tee out/windows-docker-ostype.txt
+          echo "Linux container run attempt:" | tee -a out/windows-docker-ostype.txt
+          docker run --rm --platform linux/amd64 cgr.dev/chainguard/wolfi-base:latest echo hello 2>&1 | tee -a out/windows-docker-ostype.txt || echo "exit=$? (expected: cannot run Linux containers on the Windows runner)" | tee -a out/windows-docker-ostype.txt
+      - uses: actions/upload-artifact@v4
+        with: { name: matrix-windows-container-check, path: out }

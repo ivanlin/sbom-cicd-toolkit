@@ -1,0 +1,14 @@
+# .github/workflows/sbom-cicd.yml — drop-in for any repo. Source scan via the reusable workflow.
+name: sbom-cicd
+on:
+  push: { branches: [ main ] }
+  pull_request:
+  workflow_dispatch:
+permissions: { contents: read }
+jobs:
+  sbom-cve-gate:
+    uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.0.0
+    with:
+      name: my-project           # artifact / SBOM name
+      source: .                  # directory to scan (repo-relative)
+      fail_on: CRITICAL          # CRITICAL | HIGH | MEDIUM | LOW | none

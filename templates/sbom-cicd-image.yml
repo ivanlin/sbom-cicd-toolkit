@@ -1,0 +1,25 @@
+# .github/workflows/sbom-cicd.yml — variant for repos whose artifact is a container image.
+name: sbom-cicd
+on:
+  push: { branches: [ main ] }
+  workflow_dispatch:
+permissions: { contents: read }
+env:
+  TOOLKIT: ghcr.io/ivanlin/sbom-cicd-toolkit:1.0.0
+jobs:
+  build-scan-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image under test
+        run: docker build -t app:ci .            # <- your build command
+      - name: Save it as a tar for the scanner
+        run: docker save app:ci -o /tmp/app.tar
+      - name: SBOM + CVE gate
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" -v /tmp/app.tar:/in/app.tar:ro \
+            "$TOOLKIT" scan --source /src --image-tar /in/app.tar --name my-app --out /out --fail-on CRITICAL
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sbom-cve-gate, path: out }

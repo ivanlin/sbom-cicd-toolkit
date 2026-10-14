@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# sbomgate — SBOM (CycloneDX + SPDX) + CVE scan (grype + trivy) + policy gate.
+# One command, identical behaviour in the container and natively on macOS/Linux/Windows(Git Bash).
+# bash 3.2 compatible on purpose (macOS ships 3.2): no associative arrays, no ${x,,}.
+#
+#   sbomgate scan --source DIR [--image-tar FILE | --image REF] [--out DIR] [--name NAME]
+#                 [--label VERSION] [--fail-on CRITICAL|HIGH|MEDIUM|LOW|none]
+#                 [--allowlist FILE] [--only-fixed] [--no-trivy]
+#   sbomgate tools        # versions of every bundled tool, as JSON
+#   sbomgate version      # toolkit version
+#
+# Exit codes: 0 gate PASS · 2 gate FAIL · 1 tool/usage/policy error (e.g. expired exemption).
+set -euo pipefail
+
+SBOMGATE_HOME="${SBOMGATE_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+TOOLKIT_VERSION="$(tr -d '[:space:]' < "$SBOMGATE_HOME/VERSION" 2>/dev/null || echo 0.0.0-dev)"
+TODAY="$(date -u +%Y-%m-%d)"
+NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+log()  { printf '[sbomgate %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+die()  { printf '[sbomgate] ERROR: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "required tool not on PATH: $1"; }
+# bind mounts are often owned by another uid: without safe.directory git refuses and the git filter would silently skip
+g() { git -c safe.directory='*' "$@"; }
+abspath() { ( cd "$(dirname "$1")" && printf '%s/%s\n' "$(pwd)" "$(basename "$1")" ); }
+
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+
+runtime_kind() {
+  if [ -n "${SBOMGATE_RUNTIME:-}" ]; then printf '%s' "$SBOMGATE_RUNTIME"
+  elif [ -f /.dockerenv ] || grep -qs 'docker\|containerd' /proc/1/cgroup 2>/dev/null; then printf 'container'
+  else printf 'native'; fi
+}
+host_os()   { case "$(uname -s)" in Darwin) echo macos;; Linux) echo linux;; MINGW*|MSYS*|CYGWIN*) echo windows;; *) uname -s;; esac; }
+host_arch() { case "$(uname -m)" in x86_64|amd64) echo amd64;; arm64|aarch64) echo arm64;; *) uname -m;; esac; }
+
+tool_versions_json() {
+  need syft; need grype; need jq
+  local syft_v grype_v trivy_v yq_v jq_v
+  syft_v="$(syft version -o json 2>/dev/null | jq -r .version)"
+  grype_v="$(grype version -o json 2>/dev/null | jq -r .version)"
+  if command -v trivy >/dev/null 2>&1; then trivy_v="$(trivy --version 2>/dev/null | sed -n 's/^Version: *//p' | head -1)"; else trivy_v="absent"; fi
+  if command -v yq >/dev/null 2>&1; then yq_v="$(yq --version 2>/dev/null | sed 's/.*version v\{0,1\}//')"; else yq_v="absent"; fi
+  jq_v="$(jq --version 2>/dev/null | sed 's/^jq-//')"
+  jq -n --arg t "$TOOLKIT_VERSION" --arg s "$syft_v" --arg g "$grype_v" --arg tr "$trivy_v" --arg y "$yq_v" --arg j "$jq_v" \
+     --arg os "$(host_os)" --arg arch "$(host_arch)" --arg rt "$(runtime_kind)" \
+     '{toolkit:$t, syft:$s, grype:$g, trivy:$tr, yq:$y, jq:$j, platform:{os:$os, arch:$arch, runtime:$rt}}'
+}
+
+sev_rank() {  # CRITICAL=4 HIGH=3 MEDIUM=2 LOW=1 none=0
+  case "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')" in
+    CRITICAL) echo 4;; HIGH) echo 3;; MEDIUM) echo 2;; LOW) echo 1;; NONE) echo 0;;
+    *) die "--fail-on must be one of CRITICAL|HIGH|MEDIUM|LOW|none (got '$1')";;
+  esac
+}
+
+# ── allowlist → grype ignore config ──────────────────────────────────────────
+# .sbom-cicd/allowlist.yaml:
+#   version: 1
+#   exemptions:
+#     - vulnerability: CVE-2024-1234      (required)
+#       package: name-or-empty            (optional; empty = any package)
+#       reason: why this is acceptable    (required)
+#       approved_by: Name <email>         (required)
+#       approved_on: YYYY-MM-DD           (required)
+#       expires: YYYY-MM-DD               (required; past date = policy error, exit 1)
+render_allowlist() {  # $1 allowlist.yaml  $2 grype-config-out  $3 exemptions-json-out
+  need yq
+  local n i vuln pkg reason by on exp
+  n="$(yq -r '.exemptions | length' "$1")"
+  [ "$n" = "null" ] && n=0
+  printf 'ignore:\n' > "$2"
+  printf '[' > "$3"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    vuln="$(yq -r ".exemptions[$i].vulnerability // \"\"" "$1")"
+    pkg="$(yq -r ".exemptions[$i].package // \"\"" "$1")"
+    reason="$(yq -r ".exemptions[$i].reason // \"\"" "$1")"
+    by="$(yq -r ".exemptions[$i].approved_by // \"\"" "$1")"
+    on="$(yq -r ".exemptions[$i].approved_on // \"\"" "$1")"
+    exp="$(yq -r ".exemptions[$i].expires // \"\"" "$1")"
+    [ -n "$vuln" ] && [ -n "$reason" ] && [ -n "$by" ] && [ -n "$on" ] && [ -n "$exp" ] \
+      || die "allowlist entry #$i is incomplete: vulnerability, reason, approved_by, approved_on, expires are all required"
+    printf '%s' "$exp" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || die "allowlist entry #$i: expires must be YYYY-MM-DD"
+    if [ "$exp" \< "$TODAY" ]; then die "allowlist entry #$i ($vuln) EXPIRED on $exp — renew the approval or remove it"; fi
+    printf '  - vulnerability: "%s"\n' "$vuln" >> "$2"
+    [ -n "$pkg" ] && printf '    package:\n      name: "%s"\n' "$pkg" >> "$2"
+    [ "$i" -gt 0 ] && printf ',' >> "$3"
+    jq -n --arg v "$vuln" --arg p "$pkg" --arg r "$reason" --arg b "$by" --arg o "$on" --arg e "$exp" \
+       '{vulnerability:$v, package:$p, reason:$r, approved_by:$b, approved_on:$o, expires:$e}' >> "$3"
+    i=$((i + 1))
+  done
+  printf ']' >> "$3"
+  log "allowlist: $n exemption(s) accepted from $1"
+}
+
+# ── scan ─────────────────────────────────────────────────────────────────────
+cmd_scan() {
+  local SRC="" IMAGE_TAR="" IMAGE_REF="" OUT="" NAME="" LABEL="" FAIL_ON="${SBOMGATE_FAIL_ON:-CRITICAL}" ALLOW="" ONLY_FIXED=0 NO_TRIVY=0 GIT_FILTER=1 EXCL_ARGS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --source) SRC="$2"; shift 2;;      --image-tar) IMAGE_TAR="$2"; shift 2;;
+      --image) IMAGE_REF="$2"; shift 2;; --out) OUT="$2"; shift 2;;
+      --name) NAME="$2"; shift 2;;       --label) LABEL="$2"; shift 2;;
+      --fail-on) FAIL_ON="$2"; shift 2;; --allowlist) ALLOW="$2"; shift 2;;
+      --only-fixed) ONLY_FIXED=1; shift;; --no-trivy) NO_TRIVY=1; shift;;
+      --exclude) EXCL_ARGS+=(--exclude "$2"); shift 2;; --no-git-filter) GIT_FILTER=0; shift;;
+      -h|--help) usage; exit 0;;
+      *) die "unknown argument: $1";;
+    esac
+  done
+  [ -n "$SRC" ] || [ -n "$IMAGE_TAR" ] || [ -n "$IMAGE_REF" ] || die "--source DIR (and/or --image-tar / --image) is required"
+  need syft; need grype; need jq
+  [ "$NO_TRIVY" = 1 ] || need trivy
+  local rank; rank="$(sev_rank "$FAIL_ON")"
+
+  if [ -n "$SRC" ]; then [ -d "$SRC" ] || die "--source $SRC is not a directory"; SRC="$(cd "$SRC" && pwd)"; fi
+  [ -n "$OUT" ] || OUT="${SRC:-.}/sbom-out"
+  mkdir -p "$OUT/sbom" "$OUT/scan" "$OUT/gate"; OUT="$(cd "$OUT" && pwd)"
+  [ -n "$NAME" ] || NAME="$(basename "${SRC:-${IMAGE_REF:-${IMAGE_TAR}}}" | sed 's/[^A-Za-z0-9._-]/_/g')"
+  local GIT_SHA="" GIT_DIRTY=""
+  if [ -n "$SRC" ] && command -v git >/dev/null 2>&1 && g -C "$SRC" rev-parse HEAD >/dev/null 2>&1; then
+    GIT_SHA="$(g -C "$SRC" rev-parse HEAD)"
+    [ -n "$(g -C "$SRC" status --porcelain 2>/dev/null)" ] && GIT_DIRTY="dirty"
+  fi
+  [ -n "$LABEL" ] || LABEL="${GIT_SHA:+${GIT_SHA}}"; [ -n "$LABEL" ] || LABEL="unversioned"
+  [ -n "$ALLOW" ] || { [ -n "$SRC" ] && [ -f "$SRC/.sbom-cicd/allowlist.yaml" ] && ALLOW="$SRC/.sbom-cicd/allowlist.yaml"; } || true
+
+  exec > >(tee -a "$OUT/sbomgate.log") 2>&1
+  log "sbom-cicd-toolkit $TOOLKIT_VERSION · $(host_os)/$(host_arch) · runtime=$(runtime_kind)"
+  log "name=$NAME label=$LABEL fail_on=$FAIL_ON only_fixed=$ONLY_FIXED out=$OUT"
+  tool_versions_json > "$OUT/gate/tools.json"
+  log "tools: $(jq -c 'del(.platform)' "$OUT/gate/tools.json")"
+
+  # allowlist
+  local GRYPE_CFG="$OUT/gate/grype-ignore.yaml" EXEMPT="$OUT/gate/exemptions.json"
+  if [ -n "$ALLOW" ]; then
+    [ -f "$ALLOW" ] || die "--allowlist $ALLOW not found"
+    render_allowlist "$ALLOW" "$GRYPE_CFG" "$EXEMPT"
+  else
+    printf 'ignore: []\n' > "$GRYPE_CFG"; printf '[]' > "$EXEMPT"; log "allowlist: none"
+  fi
+
+  # SBOMs
+  local KINDS=""
+  local SCAN_DIR="" SNAP_FILES=""
+  if [ -n "$SRC" ]; then
+    SCAN_DIR="$SRC"
+    if [ "$GIT_FILTER" = 1 ] && [ -n "$GIT_SHA" ]; then
+      # Snapshot = tracked + untracked-but-not-ignored files: exactly what a commit would contain,
+      # including a builder's uncommitted work, minus caches/runtime dirs listed in .gitignore.
+      SCAN_DIR="$OUT/.source-snapshot"; rm -rf "$SCAN_DIR"; mkdir -p "$SCAN_DIR"
+      local f n=0
+      while IFS= read -r -d '' f; do
+        [ -f "$SRC/$f" ] || continue
+        case "$f" in */*) mkdir -p "$SCAN_DIR/${f%/*}";; esac
+        cp -p "$SRC/$f" "$SCAN_DIR/$f" 2>/dev/null || cp "$SRC/$f" "$SCAN_DIR/$f"
+        n=$((n + 1))
+      done < <(g -C "$SRC" ls-files -z --cached --others --exclude-standard)
+      SNAP_FILES="$n"
+      log "git filter: snapshot of $n tracked/untracked-not-ignored file(s) -> $SCAN_DIR"
+    fi
+    log "syft: source SBOM of $SRC (excludes: ${EXCL_ARGS[*]-none})"
+    local excl=""
+    case "$OUT" in "$SRC"/*) excl="--exclude ./${OUT#"$SRC"/}/**";; esac
+    # shellcheck disable=SC2086
+    syft scan "dir:$SCAN_DIR" -q --source-name "$NAME" --source-version "$LABEL" --exclude './.git/**' $excl ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} \
+      -o "cyclonedx-json=$OUT/sbom/$NAME.source.cdx.json" -o "spdx-json=$OUT/sbom/$NAME.source.spdx.json"
+    [ "$SCAN_DIR" = "$SRC" ] || rm -rf "$SCAN_DIR"
+    KINDS="source"
+  fi
+  if [ -n "$IMAGE_TAR" ]; then
+    [ -f "$IMAGE_TAR" ] || die "--image-tar $IMAGE_TAR not found"
+    log "syft: image SBOM of docker-archive:$IMAGE_TAR"
+    syft scan "docker-archive:$IMAGE_TAR" -q --source-name "$NAME-image" --source-version "$LABEL" \
+      -o "cyclonedx-json=$OUT/sbom/$NAME.image.cdx.json" -o "spdx-json=$OUT/sbom/$NAME.image.spdx.json"
+    KINDS="$KINDS image"
+  elif [ -n "$IMAGE_REF" ]; then
+    log "syft: image SBOM of docker:$IMAGE_REF (needs the docker socket)"
+    syft scan "docker:$IMAGE_REF" -q --source-name "$NAME-image" --source-version "$LABEL" \
+      -o "cyclonedx-json=$OUT/sbom/$NAME.image.cdx.json" -o "spdx-json=$OUT/sbom/$NAME.image.spdx.json"
+    KINDS="$KINDS image"
+  fi
+
+  # Scans
+  local kind of="" sboms="[]"
+  [ "$ONLY_FIXED" = 1 ] && of="--only-fixed"
+  for kind in $KINDS; do
+    local cdx="$OUT/sbom/$NAME.$kind.cdx.json" spdx="$OUT/sbom/$NAME.$kind.spdx.json"
+    sboms="$(jq -c --arg k "$kind" --arg c "$cdx" --arg s "$spdx" \
+      --argjson nc "$(jq '.components|length' "$cdx")" --argjson ns "$(jq '.packages|length' "$spdx")" \
+      --arg cv "$(jq -r '.specVersion' "$cdx")" --arg sv "$(jq -r '.spdxVersion' "$spdx")" \
+      '. + [{kind:$k, cyclonedx:{file:$c, spec:$cv, components:$nc}, spdx:{file:$s, spec:$sv, packages:$ns}}]' <<<"$sboms")"
+    log "grype: $kind ($(jq '.components|length' "$cdx") components)"
+    # shellcheck disable=SC2086
+    grype "sbom:$cdx" -q -o json --file "$OUT/scan/grype.$kind.json" -c "$GRYPE_CFG" $of
+    jq --arg k "$kind" '[ .matches[] | {id:.vulnerability.id, severity:(.vulnerability.severity|ascii_upcase),
+        package:.artifact.name, version:.artifact.version, type:.artifact.type,
+        fixed_in:((.vulnerability.fix.versions // [])|join(", ")), fix_state:(.vulnerability.fix.state // "unknown"),
+        kind:$k, scanner:"grype"} ] | unique_by(.id,.package,.version)' "$OUT/scan/grype.$kind.json" > "$OUT/gate/norm.grype.$kind.json"
+    jq '{ignored:(.ignoredMatches // [] | length), db:(.descriptor.db // {} | {built: (.built // .status.built // null), schema: (.schemaVersion // .status.schemaVersion // null)})}' \
+      "$OUT/scan/grype.$kind.json" > "$OUT/gate/meta.grype.$kind.json"
+    if [ "$NO_TRIVY" = 0 ]; then
+      log "trivy: $kind"
+      trivy sbom "$cdx" -q --format json --output "$OUT/scan/trivy.$kind.json" --scanners vuln
+      jq --arg k "$kind" '[ (.Results // [])[] | (.Vulnerabilities // [])[] | {id:.VulnerabilityID, severity:(.Severity|ascii_upcase),
+          package:.PkgName, version:.InstalledVersion, fixed_in:(.FixedVersion // ""), kind:$k, scanner:"trivy"} ] | unique_by(.id,.package,.version)' \
+          "$OUT/scan/trivy.$kind.json" > "$OUT/gate/norm.trivy.$kind.json"
+    else
+      printf '[]' > "$OUT/gate/norm.trivy.$kind.json"
+    fi
+  done
+
+  # Gate
+  local RESULT counted exit_code
+  jq -s 'add // []' "$OUT"/gate/norm.grype.*.json > "$OUT/gate/findings.grype.json"
+  jq -s 'add // []' "$OUT"/gate/norm.trivy.*.json > "$OUT/gate/findings.trivy.json"
+  jq -s '{ignored:(map(.ignored)|add // 0), db:(.[0].db // {})}' "$OUT"/gate/meta.grype.*.json > "$OUT/gate/meta.grype.json"
+  counted="$(jq --argjson r "$rank" '
+      def rk: if .=="CRITICAL" then 4 elif .=="HIGH" then 3 elif .=="MEDIUM" then 2 elif .=="LOW" then 1 else 0 end;
+      if $r == 0 then 0 else [ .[] | select((.severity|rk) >= $r) ] | length end' "$OUT/gate/findings.grype.json")"
+  if [ "$counted" -gt 0 ]; then RESULT=FAIL; exit_code=2; else RESULT=PASS; exit_code=0; fi
+
+  jq -n --arg result "$RESULT" --argjson counted "$counted" --arg fail_on "$(printf '%s' "$FAIL_ON" | tr '[:lower:]' '[:upper:]')" \
+     --argjson only_fixed "$([ "$ONLY_FIXED" = 1 ] && echo true || echo false)" \
+     --arg allow "${ALLOW:-}" --slurpfile exemptions "$EXEMPT" --slurpfile tools "$OUT/gate/tools.json" \
+     --arg now "$NOW" --arg name "$NAME" --arg label "$LABEL" --arg src "${SRC:-}" --arg tar "${IMAGE_TAR:-}" --arg ref "${IMAGE_REF:-}" \
+     --arg sha "$GIT_SHA" --arg dirty "$GIT_DIRTY" --argjson sboms "$sboms" --argjson exit_code "$exit_code" \
+     --arg gitfilter "${SNAP_FILES:-off}" --arg excludes "${EXCL_ARGS[*]-}" \
+     --slurpfile g "$OUT/gate/findings.grype.json" --slurpfile t "$OUT/gate/findings.trivy.json" --slurpfile gm "$OUT/gate/meta.grype.json" \
+     --arg image_digest "${SBOMGATE_IMAGE_DIGEST:-}" '
+     def counts: reduce .[] as $f ({CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0,NEGLIGIBLE:0,UNKNOWN:0}; .[$f.severity] += 1);
+     def by_kind: group_by(.kind) | map({key:.[0].kind, value:(counts)}) | from_entries;
+     {schema:1, result:$result, exit_code:$exit_code, counted_at_or_above_threshold:$counted, timestamp:$now,
+      toolkit:{version:$tools[0].toolkit, image_digest:$image_digest},
+      platform:$tools[0].platform, tools:($tools[0]|del(.platform,.toolkit)),
+      target:{name:$name, label:$label, source:$src, image_tar:$tar, image_ref:$ref, git_sha:$sha, git_dirty:($dirty=="dirty"), git_filter_files:$gitfilter, excludes:$excludes},
+      policy:{fail_on:$fail_on, only_fixed:$only_fixed, allowlist_file:$allow, exemptions:$exemptions[0], grype_ignored_matches:$gm[0].ignored},
+      sbom:$sboms,
+      grype:{db:$gm[0].db, total:($g[0]|counts), by_kind:($g[0]|by_kind)},
+      trivy:{total:($t[0]|counts), by_kind:($t[0]|by_kind)},
+      findings_critical_high:[ $g[0][] | select(.severity=="CRITICAL" or .severity=="HIGH") ] }' > "$OUT/gate/gate.json"
+  cp "$OUT/gate/gate.json" "$OUT/gate.json"
+
+  # Human summary
+  {
+    printf '# sbomgate %s — %s\n\n' "$TOOLKIT_VERSION" "$NAME"
+    printf -- '- result: **%s** (fail_on=%s, counted=%s, exit=%s)\n' "$RESULT" "$FAIL_ON" "$counted" "$exit_code"
+    printf -- '- label: %s · git: %s%s · %s\n' "$LABEL" "${GIT_SHA:-n/a}" "${GIT_DIRTY:+ ($GIT_DIRTY)}" "$NOW"
+    printf -- '- platform: %s · tools: %s\n' "$(jq -c .platform "$OUT/gate/tools.json")" "$(jq -c 'del(.platform,.toolkit)' "$OUT/gate/tools.json")"
+    printf '\n| SBOM | CycloneDX | components | SPDX | packages |\n|---|---|---|---|---|\n'
+    jq -r '.[] | "| \(.kind) | \(.cyclonedx.spec) | \(.cyclonedx.components) | \(.spdx.spec) | \(.spdx.packages) |"' <<<"$sboms"
+    printf '\n| scanner | CRITICAL | HIGH | MEDIUM | LOW | NEGLIGIBLE | UNKNOWN |\n|---|---|---|---|---|---|---|\n'
+    jq -r '"| grype | \(.grype.total.CRITICAL) | \(.grype.total.HIGH) | \(.grype.total.MEDIUM) | \(.grype.total.LOW) | \(.grype.total.NEGLIGIBLE) | \(.grype.total.UNKNOWN) |",
+           "| trivy | \(.trivy.total.CRITICAL) | \(.trivy.total.HIGH) | \(.trivy.total.MEDIUM) | \(.trivy.total.LOW) | \(.trivy.total.NEGLIGIBLE) | \(.trivy.total.UNKNOWN) |"' "$OUT/gate.json"
+    printf '\n- exemptions applied: %s (grype ignored %s match(es))\n' "$(jq '.policy.exemptions|length' "$OUT/gate.json")" "$(jq '.policy.grype_ignored_matches' "$OUT/gate.json")"
+    if [ "$(jq '.findings_critical_high|length' "$OUT/gate.json")" -gt 0 ]; then
+      printf '\n## CRITICAL / HIGH (grype)\n\n| severity | id | package | version | fixed in | kind |\n|---|---|---|---|---|---|\n'
+      jq -r '.findings_critical_high | sort_by(.severity,.id)[] | "| \(.severity) | \(.id) | \(.package) | \(.version) | \(.fixed_in) | \(.kind) |"' "$OUT/gate.json"
+    fi
+  } > "$OUT/summary.md"
+  cat "$OUT/summary.md" >&2
+  if [ "$RESULT" = FAIL ]; then
+    log "GATE FAIL: $counted finding(s) at or above $FAIL_ON — see $OUT/gate.json"
+  else
+    log "GATE PASS: no finding at or above $FAIL_ON"
+  fi
+  exit "$exit_code"
+}
+
+case "${1:-help}" in
+  scan) shift; cmd_scan "$@";;
+  tools) tool_versions_json;;
+  version) printf '%s\n' "$TOOLKIT_VERSION";;
+  help|-h|--help) usage;;
+  *) usage; exit 64;;
+esac

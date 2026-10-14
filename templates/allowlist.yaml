@@ -1,0 +1,10 @@
+# .sbom-cicd/allowlist.yaml — CVE exemptions for THIS repository.
+# Every field is required. An expired entry fails the scan with exit 1 until renewed or removed.
+version: 1
+exemptions: []
+#  - vulnerability: CVE-2024-00000
+#    package: example-pkg            # optional; omit to exempt the CVE for any package
+#    reason: "not reachable: the vulnerable code path (XML parser) is never imported"
+#    approved_by: "Jane Doe <jane@example.com>"
+#    approved_on: 2026-10-15
+#    expires: 2027-01-15

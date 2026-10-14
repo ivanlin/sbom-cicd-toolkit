@@ -1,0 +1,91 @@
+# Release: multi-arch image -> GHCR, self-scan with the just-built image, keyless cosign sign +
+# SBOM attestation, GitHub Release with the evidence attached. Triggered by tags vX.Y.Z.
+name: release
+on:
+  push: { tags: [ "v*" ] }
+  workflow_dispatch:
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+permissions: { contents: write, packages: write, id-token: write }
+jobs:
+  build-push-selfscan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        name: Version comes from VERSION; a tag must match it
+        run: |
+          v="$(tr -d '[:space:]' < VERSION)"; echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then [ "$GITHUB_REF_NAME" = "v$v" ] || { echo "tag $GITHUB_REF_NAME != VERSION $v" >&2; exit 1; }; fi
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=${{ steps.ver.outputs.version }},suffix=-sha-${{ github.sha }},enable=false
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            TOOLKIT_VERSION=${{ steps.ver.outputs.version }}
+            VCS_REF=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Record the multi-arch manifest (index digest + per-arch digests)
+        run: |
+          mkdir -p out/release
+          docker buildx imagetools inspect "$IMAGE@${{ steps.build.outputs.digest }}" | tee out/release/manifest.txt
+          docker buildx imagetools inspect "$IMAGE@${{ steps.build.outputs.digest }}" --raw > out/release/manifest.json
+          echo "${{ steps.build.outputs.digest }}" > out/release/index-digest.txt
+          jq -r '.manifests[] | "\(.platform.os)/\(.platform.architecture) \(.digest)"' out/release/manifest.json | tee out/release/per-arch-digests.txt
+      - name: Self-scan — the image scans its own source tree AND its own image tar
+        id: selfscan
+        run: |
+          ref="$IMAGE@${{ steps.build.outputs.digest }}"
+          docker pull --platform linux/amd64 "$ref"
+          docker save "$ref" -o "$RUNNER_TEMP/self.tar"
+          mkdir -p out/self-scan; set +e
+          docker run --rm -e SBOMGATE_IMAGE_DIGEST="${{ steps.build.outputs.digest }}" \
+            -v "$PWD:/src:ro" -v "$PWD/out/self-scan:/out" -v "$RUNNER_TEMP/self.tar:/in/self.tar:ro" "$ref" \
+            scan --source /src --exclude './examples/**' --image-tar /in/self.tar --name sbom-cicd-toolkit --label "${{ steps.ver.outputs.version }}" --out /out --fail-on CRITICAL
+          code=$?; set -e
+          cat out/self-scan/summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+      - uses: sigstore/cosign-installer@v3
+      - name: Keyless sign the index digest + attest the image SBOM (Sigstore / Rekor)
+        run: |
+          ref="$IMAGE@${{ steps.build.outputs.digest }}"
+          cosign sign --yes "$ref" 2>&1 | tee out/release/cosign-sign.log
+          cosign attest --yes --type cyclonedx --predicate out/self-scan/sbom/sbom-cicd-toolkit.image.cdx.json "$ref" 2>&1 | tee out/release/cosign-attest.log
+          cosign verify "$ref" --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com -o text 2>&1 | tee out/release/cosign-verify.log
+      - name: Native bundle (same tools.lock, for machines without Docker)
+        run: |
+          tar -czf "out/release/sbom-cicd-toolkit-${{ steps.ver.outputs.version }}-native.tar.gz" VERSION tools.lock bin install templates policy
+          (cd out/release && sha256sum *.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: release-evidence, path: out }
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          cp out/self-scan/gate.json out/release/self-scan.gate.json
+          cp out/self-scan/summary.md out/release/self-scan.summary.md
+          cp out/self-scan/sbom/*.json out/release/
+          gh release create "$GITHUB_REF_NAME" --title "sbom-cicd-toolkit $GITHUB_REF_NAME" \
+            --notes "Image: \`$IMAGE:${{ steps.ver.outputs.version }}\` · index digest \`${{ steps.build.outputs.digest }}\` · per-arch digests in manifest.txt · self-scan gate: $(jq -r .result out/self-scan/gate.json)" \
+            out/release/*

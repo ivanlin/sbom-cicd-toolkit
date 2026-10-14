@@ -1,0 +1,6 @@
+out/
+*.tar
+.DS_Store
+reports/evidence/**/*.tar
+reports/
+.sbom-cicd/out/

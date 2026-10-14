@@ -1,0 +1,2 @@
+{ "name": "vuln-app-fixture", "version": "1.0.0", "private": true,
+  "dependencies": { "lodash": "4.17.4", "minimist": "1.2.0" } }
