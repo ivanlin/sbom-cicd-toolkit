@@ -9,7 +9,7 @@ One versioned tool, one command, same result everywhere: **SBOM (CycloneDX 1.7 +
 
 ```
 docker run --rm -v sbomgate-cache:/cache -v "$PWD:/src:ro" -v "$PWD/sbom-out:/out" \
-  ghcr.io/ivanlin/sbom-cicd-toolkit:1.0.1 scan --source /src --name my-app --out /out --fail-on CRITICAL
+  ghcr.io/ivanlin/sbom-cicd-toolkit:1.0.2 scan --source /src --name my-app --out /out --fail-on CRITICAL
 # exit 0 = PASS · 2 = FAIL (CVE at/above threshold) · 1 = tool/policy error
 ```
 

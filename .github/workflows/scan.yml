@@ -1,7 +1,7 @@
 # Reusable SBOM + CVE gate. Call it from any repo:
 #   jobs:
 #     gate:
-#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.0.1
+#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.0.2
 #       with:
 #         name: my-project
 #         source: .
@@ -27,7 +27,7 @@ on:
         default: false
       toolkit_image:
         type: string
-        default: "ghcr.io/ivanlin/sbom-cicd-toolkit:1.0.1"
+        default: "ghcr.io/ivanlin/sbom-cicd-toolkit:1.0.2"
     outputs:
       result:
         value: ${{ jobs.gate.outputs.result }}
@@ -36,20 +36,13 @@ on:
 jobs:
   gate:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
+    # No `permissions:` block on purpose: a called workflow may not ask for more than its caller
+    # grants, and the toolkit image is public, so neither packages:read nor a registry login is needed.
     outputs:
       result: ${{ steps.scan.outputs.result }}
       digest: ${{ steps.pull.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
-      - name: Log in to GHCR (no-op for a public image)
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - id: pull
         name: Pull the pinned toolkit image and record its digest
         run: |

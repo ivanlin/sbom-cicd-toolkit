@@ -25,5 +25,6 @@ cosign verify ghcr.io/ivanlin/sbom-cicd-toolkit:1.1.0 \
 **Upgrading consumers**: change the tag in `uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@vX.Y.Z` (or the `TOOLKIT` env), and `defaults.supply_chain.image` in each SSSF repo's `adws/adw_sssf_config/sssf.config.yaml`.
 
 ## Changelog
+- **1.0.2** (2026-10-15) — reusable `scan.yml`: drop the `permissions:` block and the GHCR login (a called workflow cannot request `packages: read` when the caller grants only `contents: read` → `startup_failure`; the image is public anyway). `sbomgate` fails loudly when grype/trivy exit non-zero or write an empty file (seen on a Windows host with a full disk). Image content identical to 1.0.1 (same tools.lock).
 - **1.0.1** (2026-10-15) — Windows native: pass `C:\` paths to syft/grype/trivy via cygpath; `native-install.ps1` `${dest}` parse fix; reusable `scan.yml` rewritten in block YAML (the 1.0.0 tag's copy fails GitHub's parser, so consumers must reference `@v1.0.1`). Image content otherwise identical to 1.0.0 (same tools.lock).
 - **1.0.0** (2026-10-15) — first release: syft 1.54.1, grype 0.120.1, trivy 0.76.0, yq 4.52.5, jq 1.8.1 on wolfi-base; linux/amd64 + linux/arm64; keyless cosign signature + CycloneDX attestation.

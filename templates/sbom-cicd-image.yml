@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 permissions: { contents: read }
 env:
-  TOOLKIT: ghcr.io/ivanlin/sbom-cicd-toolkit:1.0.1
+  TOOLKIT: ghcr.io/ivanlin/sbom-cicd-toolkit:1.0.2
 jobs:
   build-scan-gate:
     runs-on: ubuntu-latest
