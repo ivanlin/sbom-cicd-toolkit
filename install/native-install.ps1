@@ -11,7 +11,7 @@ $Tmp = Join-Path $env:TEMP ("sbomgate-" + [guid]::NewGuid()); New-Item -ItemType
 function Get-Verified($url, $dest, $sha) {
   Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
   $got = (Get-FileHash -Algorithm SHA256 $dest).Hash.ToLower()
-  if ($got -ne $sha) { throw "sha256 mismatch for $dest: got $got want $sha" }
+  if ($got -ne $sha) { throw "sha256 mismatch for ${dest}: got $got want $sha" }
 }
 Get-Verified "https://github.com/anchore/syft/releases/download/v$($lock.SYFT_VERSION)/syft_$($lock.SYFT_VERSION)_windows_amd64.zip" "$Tmp\syft.zip" $lock.SYFT_SHA256_windows_amd64
 Get-Verified "https://github.com/anchore/grype/releases/download/v$($lock.GRYPE_VERSION)/grype_$($lock.GRYPE_VERSION)_windows_amd64.zip" "$Tmp\grype.zip" $lock.GRYPE_SHA256_windows_amd64

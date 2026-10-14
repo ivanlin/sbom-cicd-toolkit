@@ -23,6 +23,9 @@ need() { command -v "$1" >/dev/null 2>&1 || die "required tool not on PATH: $1";
 # bind mounts are often owned by another uid: without safe.directory git refuses and the git filter would silently skip
 g() { git -c safe.directory='*' "$@"; }
 abspath() { ( cd "$(dirname "$1")" && printf '%s/%s\n' "$(pwd)" "$(basename "$1")" ); }
+# Windows/Git Bash: the scanners are native .exe and only understand C:\ paths; MSYS converts bare
+# arguments but not `dir:/d/...` or `-o fmt=/d/...`, so every tool-facing path goes through this.
+wpath() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) cygpath -w "$1";; *) printf '%s' "$1";; esac; }
 
 usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -164,21 +167,21 @@ cmd_scan() {
     local excl=""
     case "$OUT" in "$SRC"/*) excl="--exclude ./${OUT#"$SRC"/}/**";; esac
     # shellcheck disable=SC2086
-    syft scan "dir:$SCAN_DIR" -q --source-name "$NAME" --source-version "$LABEL" --exclude './.git/**' $excl ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} \
-      -o "cyclonedx-json=$OUT/sbom/$NAME.source.cdx.json" -o "spdx-json=$OUT/sbom/$NAME.source.spdx.json"
+    syft scan "dir:$(wpath "$SCAN_DIR")" -q --source-name "$NAME" --source-version "$LABEL" --exclude './.git/**' $excl ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} \
+      -o "cyclonedx-json=$(wpath "$OUT/sbom/$NAME.source.cdx.json")" -o "spdx-json=$(wpath "$OUT/sbom/$NAME.source.spdx.json")"
     [ "$SCAN_DIR" = "$SRC" ] || rm -rf "$SCAN_DIR"
     KINDS="source"
   fi
   if [ -n "$IMAGE_TAR" ]; then
     [ -f "$IMAGE_TAR" ] || die "--image-tar $IMAGE_TAR not found"
     log "syft: image SBOM of docker-archive:$IMAGE_TAR"
-    syft scan "docker-archive:$IMAGE_TAR" -q --source-name "$NAME-image" --source-version "$LABEL" \
-      -o "cyclonedx-json=$OUT/sbom/$NAME.image.cdx.json" -o "spdx-json=$OUT/sbom/$NAME.image.spdx.json"
+    syft scan "docker-archive:$(wpath "$IMAGE_TAR")" -q --source-name "$NAME-image" --source-version "$LABEL" \
+      -o "cyclonedx-json=$(wpath "$OUT/sbom/$NAME.image.cdx.json")" -o "spdx-json=$(wpath "$OUT/sbom/$NAME.image.spdx.json")"
     KINDS="$KINDS image"
   elif [ -n "$IMAGE_REF" ]; then
     log "syft: image SBOM of docker:$IMAGE_REF (needs the docker socket)"
     syft scan "docker:$IMAGE_REF" -q --source-name "$NAME-image" --source-version "$LABEL" \
-      -o "cyclonedx-json=$OUT/sbom/$NAME.image.cdx.json" -o "spdx-json=$OUT/sbom/$NAME.image.spdx.json"
+      -o "cyclonedx-json=$(wpath "$OUT/sbom/$NAME.image.cdx.json")" -o "spdx-json=$(wpath "$OUT/sbom/$NAME.image.spdx.json")"
     KINDS="$KINDS image"
   fi
 
@@ -193,7 +196,7 @@ cmd_scan() {
       '. + [{kind:$k, cyclonedx:{file:$c, spec:$cv, components:$nc}, spdx:{file:$s, spec:$sv, packages:$ns}}]' <<<"$sboms")"
     log "grype: $kind ($(jq '.components|length' "$cdx") components)"
     # shellcheck disable=SC2086
-    grype "sbom:$cdx" -q -o json --file "$OUT/scan/grype.$kind.json" -c "$GRYPE_CFG" $of
+    grype "sbom:$(wpath "$cdx")" -q -o json --file "$(wpath "$OUT/scan/grype.$kind.json")" -c "$(wpath "$GRYPE_CFG")" $of
     jq --arg k "$kind" '[ .matches[] | {id:.vulnerability.id, severity:(.vulnerability.severity|ascii_upcase),
         package:.artifact.name, version:.artifact.version, type:.artifact.type,
         fixed_in:((.vulnerability.fix.versions // [])|join(", ")), fix_state:(.vulnerability.fix.state // "unknown"),
@@ -202,7 +205,7 @@ cmd_scan() {
       "$OUT/scan/grype.$kind.json" > "$OUT/gate/meta.grype.$kind.json"
     if [ "$NO_TRIVY" = 0 ]; then
       log "trivy: $kind"
-      trivy sbom "$cdx" -q --format json --output "$OUT/scan/trivy.$kind.json" --scanners vuln
+      trivy sbom "$(wpath "$cdx")" -q --format json --output "$(wpath "$OUT/scan/trivy.$kind.json")" --scanners vuln
       jq --arg k "$kind" '[ (.Results // [])[] | (.Vulnerabilities // [])[] | {id:.VulnerabilityID, severity:(.Severity|ascii_upcase),
           package:.PkgName, version:.InstalledVersion, fixed_in:(.FixedVersion // ""), kind:$k, scanner:"trivy"} ] | unique_by(.id,.package,.version)' \
           "$OUT/scan/trivy.$kind.json" > "$OUT/gate/norm.trivy.$kind.json"
