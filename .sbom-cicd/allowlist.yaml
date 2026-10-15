@@ -5,18 +5,18 @@ exemptions:
   - vulnerability: GO-2026-6604
     package: stdlib
     reason: "Go standard-library CVE compiled into the upstream syft/grype/trivy release binaries (built with go1.26.1 / go1.26.8). Fix needs upstream rebuilds with Go >= 1.26.9; no newer upstream release exists at pin time (tools.lock). Re-evaluated on every tools.lock bump."
-    approved_by: "PROPOSED by agent job 0f739cd4 — pending sign-off by the toolkit owner (Ivan Lin)"
+    approved_by: "Ivan Lin — decision recorded 2026-10-15 (job 0f739cd4 turn 2): keep the exemption until its expiry; re-evaluate on every tools.lock bump (syft/grype 1.54.1/0.120.1 are the latest upstream releases, yq 4.54.1 still built with go1.27.1)"
     approved_on: 2026-10-15
     expires: 2026-11-15
   - vulnerability: GO-2026-6612
     package: stdlib
     reason: "Same as GO-2026-6604: Go stdlib net/http issue inside upstream scanner binaries; fixed in Go 1.26.9, upstream binaries not yet rebuilt."
-    approved_by: "PROPOSED by agent job 0f739cd4 — pending sign-off by the toolkit owner (Ivan Lin)"
+    approved_by: "Ivan Lin — decision recorded 2026-10-15 (job 0f739cd4 turn 2): keep the exemption until its expiry; re-evaluate on every tools.lock bump (syft/grype 1.54.1/0.120.1 are the latest upstream releases, yq 4.54.1 still built with go1.27.1)"
     approved_on: 2026-10-15
     expires: 2026-11-15
   - vulnerability: GO-2026-6612
     package: golang.org/x/net
     reason: "golang.org/x/net v0.52.0 / v0.59.0 vendored into upstream scanner binaries; fix v0.60.0 requires upstream rebuild."
-    approved_by: "PROPOSED by agent job 0f739cd4 — pending sign-off by the toolkit owner (Ivan Lin)"
+    approved_by: "Ivan Lin — decision recorded 2026-10-15 (job 0f739cd4 turn 2): keep the exemption until its expiry; re-evaluate on every tools.lock bump (syft/grype 1.54.1/0.120.1 are the latest upstream releases, yq 4.54.1 still built with go1.27.1)"
     approved_on: 2026-10-15
     expires: 2026-11-15
