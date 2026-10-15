@@ -78,8 +78,16 @@ jobs:
     steps:
       - shell: bash
         run: |
-          mkdir -p out; { echo "runner: windows-latest"; docker version --format '{{json .}}' 2>&1 | head -c 2000; echo; echo "daemon OSType: $(docker info --format '{{.OSType}}' 2>&1)"; } | tee out/windows-docker-ostype.txt
-          echo "Linux container run attempt:" | tee -a out/windows-docker-ostype.txt
-          docker run --rm --platform linux/amd64 cgr.dev/chainguard/wolfi-base:latest echo hello 2>&1 | tee -a out/windows-docker-ostype.txt || echo "exit=$? (expected: cannot run Linux containers on the Windows runner)" | tee -a out/windows-docker-ostype.txt
+          # Informational probe: it must RECORD what the runner can do, never fail the matrix itself
+          # (on windows-2025 images the Docker daemon is not even running -> docker info exits 1).
+          set +e +o pipefail
+          mkdir -p out; f=out/windows-docker-ostype.txt
+          echo "runner: windows-latest ($ImageOS / $RUNNER_OS)" | tee "$f"
+          docker version --format '{{json .}}' 2>&1 | head -c 2000 | tee -a "$f"; echo | tee -a "$f"
+          echo "daemon OSType: $(docker info --format '{{.OSType}}' 2>&1 | head -c 400)" | tee -a "$f"
+          echo "Linux container run attempt:" | tee -a "$f"
+          docker run --rm --platform linux/amd64 cgr.dev/chainguard/wolfi-base:latest echo hello 2>&1 | tee -a "$f"
+          echo "exit=${PIPESTATUS[0]} (expected non-zero: Windows runners cannot run the Linux toolkit image)" | tee -a "$f"
+          exit 0
       - uses: actions/upload-artifact@v4
         with: { name: matrix-windows-container-check, path: out }
