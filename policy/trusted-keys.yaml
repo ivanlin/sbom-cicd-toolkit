@@ -32,4 +32,20 @@
 # re-sign still-valid evidence with `sbomsign <repo> --resign <tag>`, then mark the old key
 # revoked and release the toolkit again.
 version: 1
-keys: []
+keys:
+  - id: interim-2026-10
+    purpose: interim
+    status: active
+    fingerprint: sha256:5b0a028c3b96fbdcb8c0bf4c7e6d7976b37361e83a4ec384403419480813ab02
+    valid_from: 2026-10-15
+    valid_until: 2027-01-13
+    revoked_on: ""
+    extended_on: ""
+    extension_reason: ""
+    note: "mac mini interim file key (RQ16); password in macOS Keychain item sbom-signing-key; replaced by YubiKey per RQ15"
+    public_key: |
+      -----BEGIN PUBLIC KEY-----
+      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEqrI0IWiKGcAM8iuHC7YXr3Xhjon4
+      kXg7DZo9g3zFSvdnDPxLUhevbluSKv7AfnuotztfzkqE9RY6eVMdRYBf/A==
+      -----END PUBLIC KEY-----
+
