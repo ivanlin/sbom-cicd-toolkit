@@ -3,6 +3,10 @@
 # HONESTY: "container" jobs run the Linux image; "native" jobs run the pinned binaries directly on
 # the runner OS. GitHub's Windows and macOS runners cannot run Linux containers, so there is no
 # container job for them — see the windows-container-check job.
+# 1.2.0 adds: `check-tools` (resolved binaries vs the *_BIN_SHA256_* table in tools.lock, RQ11) in
+# the container and native jobs, and a keyless `verify-release --skip-signature` smoke that
+# exercises gate.json schema 2 (artifacts[] hashes + source.git_sha binding, RQ9/RQ10) offline.
+# Signing itself is never done in CI (D2); scripts/test-signing.sh covers it on the mac mini.
 name: platform-matrix
 on:
   push: { branches: [ main ] }
@@ -15,9 +19,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker buildx build --platform linux/amd64 --build-arg TOOLKIT_VERSION="$(cat VERSION)" --build-arg VCS_REF="$GITHUB_SHA" -t toolkit:ci --load .
+      - name: check-tools inside the image (every binary matches tools.lock)
+        run: docker run --rm toolkit:ci check-tools
       - run: scripts/fixtures-container.sh toolkit:ci "github-actions/ubuntu-latest/linux-amd64/container" out
       - run: jq . out/result.json >> "$GITHUB_STEP_SUMMARY" && echo >> "$GITHUB_STEP_SUMMARY" && cat out/vuln/summary.md >> "$GITHUB_STEP_SUMMARY"
         if: always()
+      - name: verify-release smoke — scan clean-app with git context, then verify artifacts + sha offline, no key
+        run: |
+          mkdir -p out/release-smoke
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/out/release-smoke:/out" toolkit:ci \
+            scan --source /src/examples/clean-app --name clean-app --out /out --fail-on HIGH \
+                 --source-url "https://github.com/${{ github.repository }}" --source-ref "$GITHUB_SHA"
+          jq -e --arg sha "$GITHUB_SHA" '.schema >= 2 and .source.git_sha == $sha and (.artifacts | length) > 0' out/release-smoke/gate.json
+          docker run --rm --network none -v "$PWD/out/release-smoke:/b" toolkit:ci \
+            verify-release --bundle-dir /b --skip-signature --expect-sha "$GITHUB_SHA"
+          # negative control: a wrong commit must be refused
+          if docker run --rm --network none -v "$PWD/out/release-smoke:/b" toolkit:ci \
+               verify-release --bundle-dir /b --skip-signature --expect-sha 0000000000000000000000000000000000000000; then
+            echo "::error::verify-release accepted a wrong --expect-sha"; exit 1
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: matrix-container-linux-amd64, path: out }
@@ -26,6 +46,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker buildx build --platform linux/arm64 --build-arg TOOLKIT_VERSION="$(cat VERSION)" --build-arg VCS_REF="$GITHUB_SHA" -t toolkit:ci --load .
+      - name: check-tools inside the image (every binary matches tools.lock)
+        run: docker run --rm toolkit:ci check-tools
       - run: scripts/fixtures-container.sh toolkit:ci "github-actions/ubuntu-24.04-arm/linux-arm64/container" out
       - run: jq . out/result.json >> "$GITHUB_STEP_SUMMARY"
         if: always()
@@ -47,6 +69,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install the pinned tools natively (same tools.lock as the image)
         run: bash install/native-install.sh --prefix "$RUNNER_TEMP/tk"
+      - name: check-tools — installed binaries vs tools.lock (expected all ok; Windows informational)
+        continue-on-error: ${{ runner.os == 'Windows' }}
+        run: |
+          export PATH="$RUNNER_TEMP/tk/bin:$PATH" SBOMGATE_HOME="$RUNNER_TEMP/tk"
+          sbomgate check-tools
       - name: Fixtures
         run: |
           export PATH="$RUNNER_TEMP/tk/bin:$PATH" SBOMGATE_HOME="$RUNNER_TEMP/tk"

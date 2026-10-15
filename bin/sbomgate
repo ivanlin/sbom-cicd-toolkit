@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# sbomgate — SBOM (CycloneDX + SPDX) + CVE scan (grype + trivy) + policy gate.
+# sbomgate — SBOM (CycloneDX + SPDX) + CVE scan (grype + trivy) + policy gate + evidence verification.
 # One command, identical behaviour in the container and natively on macOS/Linux/Windows(Git Bash).
 # bash 3.2 compatible on purpose (macOS ships 3.2): no associative arrays, no ${x,,}.
 #
 #   sbomgate scan --source DIR [--image-tar FILE | --image REF] [--out DIR] [--name NAME]
 #                 [--label VERSION] [--fail-on CRITICAL|HIGH|MEDIUM|LOW|none]  (default HIGH)
-#                 [--allowlist FILE] [--only-fixed] [--no-trivy]
+#                 [--allowlist FILE] [--only-fixed] [--no-trivy] [--source-url URL] [--source-ref REF]
+#   sbomgate verify-release --bundle-dir DIR [--expect-sha SHA] [--trusted-keys F] [--at YYYY-MM-DD]
+#                 [--allow-fail-result] [--skip-signature] [--json]     # offline evidence check
+#   sbomgate verify-toolkit --image REF@sha256:... [--trusted-keys F] [--at YYYY-MM-DD] [--attestation] [--json]
+#   sbomgate check-tools [--lock FILE] [--json]   # sha256 of syft grype trivy yq jq cosign vs tools.lock
+#   sbomgate key-entry --pub cosign.pub --id ID --purpose interim|hardware --days N [--from YYYY-MM-DD] [--note T]
+#   sbomgate key-status --pub cosign.pub [--trusted-keys F] [--at YYYY-MM-DD] [--json]
 #   sbomgate tools        # versions of every bundled tool, as JSON
 #   sbomgate version      # toolkit version
 #
-# Exit codes: 0 gate PASS · 2 gate FAIL · 1 tool/usage/policy error (e.g. expired exemption).
+# Exit codes: 0 gate PASS / verification PASS · 2 gate FAIL · 1 tool/usage/policy/verification error.
 set -euo pipefail
 
 SBOMGATE_HOME="${SBOMGATE_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -26,8 +32,20 @@ abspath() { ( cd "$(dirname "$1")" && printf '%s/%s\n' "$(pwd)" "$(basename "$1"
 # Windows/Git Bash: the scanners are native .exe and only understand C:\ paths; MSYS converts bare
 # arguments but not `dir:/d/...` or `-o fmt=/d/...`, so every tool-facing path goes through this.
 wpath() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) cygpath -w "$1";; *) printf '%s' "$1";; esac; }
+# sha256 of a file / of stdin: sha256sum (Linux, Git Bash) or shasum -a 256 (macOS)
+sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+sha256_stdin() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
+file_size() { wc -c < "$1" | tr -d ' '; }
+b64decode() { base64 -d 2>/dev/null || base64 -D; }
+# never record credentials embedded in a remote URL (https://user:token@host/...)
+strip_userinfo() { printf '%s' "$1" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@#\1#'; }
+is_date() { printf '%s' "$1" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; }
+date_add_days() {  # $1 YYYY-MM-DD  $2 signed integer days -> YYYY-MM-DD (GNU date or BSD date)
+  local n="$2"; case "$n" in -*) ;; *) n="+$n";; esac
+  date -u -d "$1 $2 days" +%Y-%m-%d 2>/dev/null || date -u -j -v"${n}d" -f %Y-%m-%d "$1" +%Y-%m-%d
+}
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
 
 runtime_kind() {
   if [ -n "${SBOMGATE_RUNTIME:-}" ]; then printf '%s' "$SBOMGATE_RUNTIME"
@@ -39,15 +57,16 @@ host_arch() { case "$(uname -m)" in x86_64|amd64) echo amd64;; arm64|aarch64) ec
 
 tool_versions_json() {
   need syft; need grype; need jq
-  local syft_v grype_v trivy_v yq_v jq_v
+  local syft_v grype_v trivy_v yq_v jq_v cosign_v
   syft_v="$(syft version -o json 2>/dev/null | jq -r .version)"
   grype_v="$(grype version -o json 2>/dev/null | jq -r .version)"
   if command -v trivy >/dev/null 2>&1; then trivy_v="$(trivy --version 2>/dev/null | sed -n 's/^Version: *//p' | head -1)"; else trivy_v="absent"; fi
   if command -v yq >/dev/null 2>&1; then yq_v="$(yq --version 2>/dev/null | sed 's/.*version v\{0,1\}//')"; else yq_v="absent"; fi
   jq_v="$(jq --version 2>/dev/null | sed 's/^jq-//')"
-  jq -n --arg t "$TOOLKIT_VERSION" --arg s "$syft_v" --arg g "$grype_v" --arg tr "$trivy_v" --arg y "$yq_v" --arg j "$jq_v" \
+  if command -v cosign >/dev/null 2>&1; then cosign_v="$(cosign version --json 2>/dev/null | jq -r '.gitVersion // empty' 2>/dev/null | sed 's/^v//')"; [ -n "$cosign_v" ] || cosign_v="unknown"; else cosign_v="absent"; fi
+  jq -n --arg t "$TOOLKIT_VERSION" --arg s "$syft_v" --arg g "$grype_v" --arg tr "$trivy_v" --arg y "$yq_v" --arg j "$jq_v" --arg c "$cosign_v" \
      --arg os "$(host_os)" --arg arch "$(host_arch)" --arg rt "$(runtime_kind)" \
-     '{toolkit:$t, syft:$s, grype:$g, trivy:$tr, yq:$y, jq:$j, platform:{os:$os, arch:$arch, runtime:$rt}}'
+     '{toolkit:$t, syft:$s, grype:$g, trivy:$tr, yq:$y, jq:$j, cosign:$c, platform:{os:$os, arch:$arch, runtime:$rt}}'
 }
 
 sev_rank() {  # CRITICAL=4 HIGH=3 MEDIUM=2 LOW=1 none=0
@@ -97,9 +116,23 @@ render_allowlist() {  # $1 allowlist.yaml  $2 grype-config-out  $3 exemptions-js
   log "allowlist: $n exemption(s) accepted from $1"
 }
 
+# ── artifacts[] ──────────────────────────────────────────────────────────────
+ARTIFACT_GATE_FILES="gate/tools.json gate/exemptions.json gate/findings.grype.json gate/findings.trivy.json gate/grype-ignore.yaml"
+artifacts_json() {  # $1 out dir -> JSON [{path, sha256, size}] sorted by path (POSIX, relative)
+  local d="$1" rel f
+  {
+    ( cd "$d" && find sbom scan -type f 2>/dev/null || true )
+    for f in $ARTIFACT_GATE_FILES; do [ -f "$d/$f" ] && printf '%s\n' "$f"; done
+  } | LC_ALL=C sort -u | while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    printf '%s\t%s\t%s\n' "$rel" "$(sha256_of "$d/$rel")" "$(file_size "$d/$rel")"
+  done | jq -R -s '[ split("\n")[] | select(length > 0) | split("\t") | {path:.[0], sha256:.[1], size:(.[2]|tonumber)} ] | sort_by(.path)'
+}
+
 # ── scan ─────────────────────────────────────────────────────────────────────
 cmd_scan() {
   local SRC="" IMAGE_TAR="" IMAGE_REF="" OUT="" NAME="" LABEL="" FAIL_ON="${SBOMGATE_FAIL_ON:-HIGH}" ALLOW="" ONLY_FIXED=0 NO_TRIVY=0 GIT_FILTER=1 EXCL_ARGS=()
+  local SOURCE_URL="" SOURCE_URL_SET=0 SOURCE_REF=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --source) SRC="$2"; shift 2;;      --image-tar) IMAGE_TAR="$2"; shift 2;;
@@ -108,6 +141,7 @@ cmd_scan() {
       --fail-on) FAIL_ON="$2"; shift 2;; --allowlist) ALLOW="$2"; shift 2;;
       --only-fixed) ONLY_FIXED=1; shift;; --no-trivy) NO_TRIVY=1; shift;;
       --exclude) EXCL_ARGS+=(--exclude "$2"); shift 2;; --no-git-filter) GIT_FILTER=0; shift;;
+      --source-url) SOURCE_URL="$2"; SOURCE_URL_SET=1; shift 2;; --source-ref) SOURCE_REF="$2"; shift 2;;
       -h|--help) usage; exit 0;;
       *) die "unknown argument: $1";;
     esac
@@ -126,6 +160,10 @@ cmd_scan() {
     GIT_SHA="$(g -C "$SRC" rev-parse HEAD)"
     [ -n "$(g -C "$SRC" status --porcelain 2>/dev/null)" ] && GIT_DIRTY="dirty"
   fi
+  if [ "$SOURCE_URL_SET" = 0 ] && [ -n "$SRC" ] && command -v git >/dev/null 2>&1; then
+    SOURCE_URL="$(g -C "$SRC" remote get-url origin 2>/dev/null || true)"
+  fi
+  SOURCE_URL="$(strip_userinfo "$SOURCE_URL")"
   [ -n "$LABEL" ] || LABEL="${GIT_SHA:+${GIT_SHA}}"; [ -n "$LABEL" ] || LABEL="unversioned"
   [ -n "$ALLOW" ] || { [ -n "$SRC" ] && [ -f "$SRC/.sbom-cicd/allowlist.yaml" ] && ALLOW="$SRC/.sbom-cicd/allowlist.yaml"; } || true
 
@@ -219,7 +257,7 @@ cmd_scan() {
   done
 
   # Gate
-  local RESULT counted exit_code
+  local RESULT counted exit_code ARTS
   jq -s 'add // []' "$OUT"/gate/norm.grype.*.json > "$OUT/gate/findings.grype.json"
   jq -s 'add // []' "$OUT"/gate/norm.trivy.*.json > "$OUT/gate/findings.trivy.json"
   jq -s '{ignored:(map(.ignored)|add // 0), db:(.[0].db // {})}' "$OUT"/gate/meta.grype.*.json > "$OUT/gate/meta.grype.json"
@@ -227,6 +265,10 @@ cmd_scan() {
       def rk: if .=="CRITICAL" then 4 elif .=="HIGH" then 3 elif .=="MEDIUM" then 2 elif .=="LOW" then 1 else 0 end;
       if $r == 0 then 0 else [ .[] | select((.severity|rk) >= $r) ] | length end' "$OUT/gate/findings.grype.json")"
   if [ "$counted" -gt 0 ]; then RESULT=FAIL; exit_code=2; else RESULT=PASS; exit_code=0; fi
+  # artifacts[] (schema 2, RQ9): hashed immediately before gate.json is written; gate.json itself,
+  # gate/gate.json, summary.md and sbomgate.log are written after / streamed and are NOT listed.
+  ARTS="$OUT/gate/.artifacts.json"
+  artifacts_json "$OUT" > "$ARTS"
 
   jq -n --arg result "$RESULT" --argjson counted "$counted" --arg fail_on "$(printf '%s' "$FAIL_ON" | tr '[:lower:]' '[:upper:]')" \
      --argjson only_fixed "$([ "$ONLY_FIXED" = 1 ] && echo true || echo false)" \
@@ -235,10 +277,10 @@ cmd_scan() {
      --arg sha "$GIT_SHA" --arg dirty "$GIT_DIRTY" --argjson sboms "$sboms" --argjson exit_code "$exit_code" \
      --arg gitfilter "${SNAP_FILES:-off}" --arg excludes "${EXCL_ARGS[*]-}" \
      --slurpfile g "$OUT/gate/findings.grype.json" --slurpfile t "$OUT/gate/findings.trivy.json" --slurpfile gm "$OUT/gate/meta.grype.json" \
-     --arg image_digest "${SBOMGATE_IMAGE_DIGEST:-}" '
+     --arg image_digest "${SBOMGATE_IMAGE_DIGEST:-}" --arg src_url "$SOURCE_URL" --arg src_ref "$SOURCE_REF" --slurpfile arts "$ARTS" '
      def counts: reduce .[] as $f ({CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0,NEGLIGIBLE:0,UNKNOWN:0}; .[$f.severity] += 1);
      def by_kind: group_by(.kind) | map({key:.[0].kind, value:(counts)}) | from_entries;
-     {schema:1, result:$result, exit_code:$exit_code, counted_at_or_above_threshold:$counted, timestamp:$now,
+     {schema:2, result:$result, exit_code:$exit_code, counted_at_or_above_threshold:$counted, timestamp:$now,
       toolkit:{version:$tools[0].toolkit, image_digest:$image_digest},
       platform:$tools[0].platform, tools:($tools[0]|del(.platform,.toolkit)),
       target:{name:$name, label:$label, source:$src, image_tar:$tar, image_ref:$ref, git_sha:$sha, git_dirty:($dirty=="dirty"), git_filter_files:$gitfilter, excludes:$excludes},
@@ -246,7 +288,10 @@ cmd_scan() {
       sbom:$sboms,
       grype:{db:$gm[0].db, total:($g[0]|counts), by_kind:($g[0]|by_kind)},
       trivy:{total:($t[0]|counts), by_kind:($t[0]|by_kind)},
-      findings_critical_high:[ $g[0][] | select(.severity=="CRITICAL" or .severity=="HIGH") ] }' > "$OUT/gate/gate.json"
+      findings_critical_high:[ $g[0][] | select(.severity=="CRITICAL" or .severity=="HIGH") ],
+      source:{remote_url:$src_url, git_sha:$sha, git_ref:$src_ref},
+      artifacts:$arts[0] }' > "$OUT/gate/gate.json"
+  rm -f "$ARTS"
   cp "$OUT/gate/gate.json" "$OUT/gate.json"
 
   # Human summary
@@ -275,8 +320,354 @@ cmd_scan() {
   exit "$exit_code"
 }
 
+# ── trusted keys (RQ3) ───────────────────────────────────────────────────────
+# A key is USABLE at date T iff status == active AND valid_from <= T <= valid_until.
+resolve_trusted_keys() {  # $1 explicit --trusted-keys (may be empty) -> path on stdout
+  if [ -n "$1" ]; then [ -f "$1" ] || die "--trusted-keys $1 not found"; printf '%s' "$1"; return; fi
+  if [ -n "${SBOMGATE_TRUSTED_KEYS:-}" ]; then [ -f "$SBOMGATE_TRUSTED_KEYS" ] || die "SBOMGATE_TRUSTED_KEYS=$SBOMGATE_TRUSTED_KEYS not found"; printf '%s' "$SBOMGATE_TRUSTED_KEYS"; return; fi
+  if [ -f "$SBOMGATE_HOME/trusted-keys.yaml" ]; then printf '%s' "$SBOMGATE_HOME/trusted-keys.yaml"; return; fi
+  if [ -f "$SBOMGATE_HOME/policy/trusted-keys.yaml" ]; then printf '%s' "$SBOMGATE_HOME/policy/trusted-keys.yaml"; return; fi
+  die "no trusted-keys.yaml (tried --trusted-keys, \$SBOMGATE_TRUSTED_KEYS, $SBOMGATE_HOME/trusted-keys.yaml, $SBOMGATE_HOME/policy/trusted-keys.yaml)"
+}
+pem_fingerprint() {  # PEM public key on stdin -> hex sha256 of the DER SubjectPublicKeyInfo ("" if no PEM)
+  local b64
+  b64="$(sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' | grep -v -- '-----' | tr -d ' \t\r\n')"
+  [ -n "$b64" ] || return 0
+  printf '%s' "$b64" | b64decode | sha256_stdin
+}
+hint_to_hex() { printf '%s' "$1" | b64decode | od -An -v -tx1 | tr -d ' \n'; }
+# load_trusted_keys FILE DIR -> writes DIR/keys.json (normalized) and DIR/<n>.pem; dies on a malformed file
+load_trusted_keys() {
+  local f="$1" d="$2" n i pem fp_calc fp_decl err
+  need yq; need jq
+  yq -o=json '.' "$f" > "$d/raw.json" 2>"$d/yq.err" || die "trusted keys $f: not valid YAML ($(head -1 "$d/yq.err"))"
+  [ "$(jq -r '.version // empty' "$d/raw.json")" = "1" ] || die "trusted keys $f: version must be 1"
+  jq -e '(.keys // []) | type == "array"' "$d/raw.json" >/dev/null || die "trusted keys $f: keys must be a list"
+  n="$(jq '(.keys // []) | length' "$d/raw.json")"
+  printf '[' > "$d/keys.json"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    pem="$d/$i.pem"
+    jq -r ".keys[$i].public_key // \"\"" "$d/raw.json" > "$pem"
+    fp_calc="$(pem_fingerprint < "$pem")"
+    fp_decl="$(jq -r ".keys[$i].fingerprint // \"\"" "$d/raw.json" | sed 's/^sha256://' | tr '[:upper:]' '[:lower:]')"
+    err=""
+    if [ -z "$fp_calc" ]; then err="public_key is not a PEM public key"
+    elif [ "$fp_calc" != "$fp_decl" ]; then err="fingerprint sha256:$fp_decl does not match public_key (sha256:$fp_calc)"; fi
+    [ "$i" -gt 0 ] && printf ',' >> "$d/keys.json"
+    jq -c --argjson i "$i" --arg fp "$fp_calc" --arg pem "$pem" --arg err "$err" '
+      .keys[$i] as $k
+      | {id:($k.id // "" | tostring), purpose:($k.purpose // "" | tostring), status:($k.status // "" | tostring),
+         fingerprint_hex:$fp, valid_from:($k.valid_from // "" | tostring), valid_until:($k.valid_until // "" | tostring),
+         revoked_on:($k.revoked_on // "" | tostring), pem:$pem, entry_error:$err}
+      | if .entry_error == "" and .id == "" then .entry_error = "id missing" else . end
+      | if .entry_error == "" and ((.valid_from|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$"))|not) then .entry_error = "valid_from must be YYYY-MM-DD" else . end
+      | if .entry_error == "" and ((.valid_until|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$"))|not) then .entry_error = "valid_until (required) must be YYYY-MM-DD" else . end
+      | if .entry_error == "" and (.status != "active" and .status != "revoked") then .entry_error = "status must be active|revoked" else . end
+      ' "$d/raw.json" >> "$d/keys.json"
+    i=$((i + 1))
+  done
+  printf ']' >> "$d/keys.json"
+  jq -r '.[] | select(.entry_error != "") | "trusted key #\(.id // "?"): ignored — \(.entry_error)"' "$d/keys.json" | while IFS= read -r l; do log "WARN $l"; done
+}
+# key state at date $2 for key JSON object on stdin: usable | key-revoked | key-expired | key-not-yet-valid | key-invalid-entry
+# shellcheck disable=SC2016  # jq program, $at is a jq variable
+KEY_STATE_JQ='def kstate($at): if .entry_error != "" then "key-invalid-entry" elif .status == "revoked" then "key-revoked"
+  elif $at < .valid_from then "key-not-yet-valid" elif $at > .valid_until then "key-expired" else "usable" end;'
+
+# ── verify-release (RQ1, RQ10) ───────────────────────────────────────────────
+cmd_verify_release() {
+  local DIR="" EXPECT="" TK="" AT="$TODAY" ALLOW_FAIL=0 SKIP_SIG=0 JSON=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --bundle-dir) DIR="$2"; shift 2;; --expect-sha) EXPECT="$2"; shift 2;;
+      --trusted-keys) TK="$2"; shift 2;; --at) AT="$2"; shift 2;;
+      --allow-fail-result) ALLOW_FAIL=1; shift;; --skip-signature) SKIP_SIG=1; shift;;
+      --json) JSON=1; shift;; -h|--help) usage; exit 0;;
+      *) die "unknown argument: $1";;
+    esac
+  done
+  [ -n "$DIR" ] || die "--bundle-dir DIR is required"
+  [ -d "$DIR" ] || die "--bundle-dir $DIR is not a directory"
+  is_date "$AT" || die "--at must be YYYY-MM-DD (got '$AT')"
+  need jq
+  DIR="$(cd "$DIR" && pwd)"
+  local W; W="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$W'" EXIT
+  : > "$W/checks.jsonl"; : > "$W/bundles.jsonl"; : > "$W/verified"
+  local FAILED=0
+  chk() {  # $1 PASS|FAIL|SKIP|WARN  $2 name  $3 detail
+    printf '%-4s %s: %s\n' "$1" "$2" "$3" >&2
+    jq -cn --arg s "$1" --arg n "$2" --arg d "$3" '{name:$n, status:$s, detail:$d}' >> "$W/checks.jsonl"
+    [ "$1" = FAIL ] && FAILED=1
+    return 0
+  }
+  finish() {
+    local result=PASS; [ "$FAILED" = 0 ] || result=FAIL
+    printf '%s verify-release: %s (at=%s)\n' "$result" "$DIR" "$AT" >&2
+    if [ "$JSON" = 1 ]; then
+      jq -n --arg r "$result" --arg dir "$DIR" --arg at "$AT" --slurpfile c "$W/checks.jsonl" --slurpfile b "$W/bundles.jsonl" \
+        --arg v "$(sort -u "$W/verified" | tr '\n' ' ')" \
+        '{result:$r, bundle_dir:$dir, at:$at, checks:$c, bundles:$b, key_ids_verified:($v | split(" ") | map(select(length > 0)))}'
+    fi
+    [ "$result" = PASS ] && exit 0
+    exit 1
+  }
+  printf '[verify-release] %s · sbom-cicd-toolkit %s · at %s\n' "$DIR" "$TOOLKIT_VERSION" "$AT" >&2
+
+  # (1) gate.json parses, schema >= 2
+  local G="$DIR/gate.json" schema
+  if [ ! -f "$G" ]; then chk FAIL schema "gate.json missing in $DIR"; finish; fi
+  if ! jq -e 'type == "object"' "$G" >/dev/null 2>&1; then chk FAIL schema "gate.json is not valid JSON"; finish; fi
+  schema="$(jq -r '.schema // 0' "$G")"
+  case "$schema" in ''|*[!0-9]*) schema=0;; esac
+  if [ "$schema" -lt 2 ]; then chk FAIL schema "gate.json schema $schema < 2 (no artifacts[]/source binding; rescan with toolkit >= 1.2.0)"; finish; fi
+  chk PASS schema "gate.json schema $schema"
+
+  # (2) artifacts[]: every entry exists, sha256 + size match
+  local n bad=0 i path want_sha want_size got_sha got_size
+  n="$(jq '(.artifacts // []) | length' "$G")"
+  if [ "$n" -eq 0 ]; then chk FAIL artifacts "artifacts[] is empty"; bad=1; fi
+  jq -r '(.artifacts // [])[] | [(.path|tostring), (.sha256|tostring), (.size|tostring)] | @tsv' "$G" > "$W/arts.tsv"
+  while IFS='	' read -r path want_sha want_size; do
+    case "/$path/" in */../*|*/./*|//*) chk FAIL artifact-path "$path: unsafe path (absolute or contains . / ..)"; bad=1; continue;; esac
+    case "$path" in /*|*\\*) chk FAIL artifact-path "$path: unsafe path"; bad=1; continue;; esac
+    if [ ! -f "$DIR/$path" ]; then chk FAIL artifact-missing "$path"; bad=1; continue; fi
+    got_sha="$(sha256_of "$DIR/$path")"; got_size="$(file_size "$DIR/$path")"
+    if [ "$got_sha" != "$want_sha" ]; then chk FAIL artifact-hash "$path sha256 $got_sha != $want_sha"; bad=1; fi
+    if [ "$got_size" != "$want_size" ]; then chk FAIL artifact-size "$path size $got_size != $want_size"; bad=1; fi
+  done < "$W/arts.tsv"
+  [ "$bad" = 0 ] && chk PASS artifacts "$n file(s): sha256 + size match"
+  # files present under sbom/ scan/ but not bound by artifacts[] are reported, not fatal
+  ( cd "$DIR" && find sbom scan -type f 2>/dev/null || true ) | LC_ALL=C sort > "$W/present"
+  jq -r '(.artifacts // [])[].path' "$G" | LC_ALL=C sort > "$W/listed"
+  i="$(comm -23 "$W/present" "$W/listed" | tr '\n' ' ')"
+  [ -z "$i" ] || chk WARN artifacts-unlisted "not covered by the signature: $i"
+
+  # (3) git sha binding
+  local gsha
+  gsha="$(jq -r '.source.git_sha // .target.git_sha // ""' "$G")"
+  if [ -n "$EXPECT" ]; then
+    EXPECT="$(printf '%s' "$EXPECT" | tr '[:upper:]' '[:lower:]')"
+    if [ "${#EXPECT}" -lt 7 ]; then chk FAIL git-sha "--expect-sha needs at least 7 hex chars (got '$EXPECT')"
+    elif [ -z "$gsha" ]; then chk FAIL git-sha "gate.json has no source.git_sha"
+    else
+      case "$gsha" in "$EXPECT"*) chk PASS git-sha "source.git_sha $gsha matches $EXPECT";;
+        *) chk FAIL git-sha "source.git_sha $gsha != expected $EXPECT";; esac
+    fi
+  else
+    chk SKIP git-sha "no --expect-sha given (gate.json source.git_sha=${gsha:-none})"
+  fi
+
+  # (4) signatures: ANY bundle verified by a usable trusted key -> PASS
+  if [ "$SKIP_SIG" = 1 ]; then
+    chk SKIP signature "--skip-signature (pre-sign self check)"
+  else
+    need cosign
+    local TKF b hint hex kid state det fname ok_any=0 nb=0
+    TKF="$(resolve_trusted_keys "$TK")"
+    load_trusted_keys "$TKF" "$W"
+    for b in "$DIR"/gate.json.*.sigstore.json; do
+      [ -f "$b" ] || continue
+      nb=$((nb + 1)); fname="$(basename "$b")"; kid=""; state=""; det=""
+      if ! jq -e 'type == "object"' "$b" >/dev/null 2>&1; then
+        state="bundle-invalid"; det="not valid JSON"
+      else
+        hint="$(jq -r '.verificationMaterial.publicKey.hint // ""' "$b")"
+        if [ -n "$hint" ]; then
+          hex="$(hint_to_hex "$hint")"
+          kid="$(jq -r --arg h "$hex" '[.[] | select(.fingerprint_hex == $h)][0].id // ""' "$W/keys.json")"
+          if [ -z "$kid" ]; then
+            state="key-unknown"; det="signing key sha256:$hex is not in $TKF"
+          else
+            state="$(jq -r --arg h "$hex" --arg at "$AT" "$KEY_STATE_JQ"' [.[] | select(.fingerprint_hex == $h)][0] | kstate($at)' "$W/keys.json")"
+            if [ "$state" = usable ]; then
+              if cosign verify-blob --key "$(jq -r --arg h "$hex" '[.[] | select(.fingerprint_hex == $h)][0].pem' "$W/keys.json")" \
+                   --bundle "$b" --insecure-ignore-tlog "$G" >"$W/cosign.out" 2>"$W/cosign.err"; then
+                state="verified"
+              else
+                state="signature-invalid"; det="$(grep -v '^WARNING' "$W/cosign.err" | tail -1)"
+              fi
+            else
+              det="$(jq -r --arg h "$hex" '[.[] | select(.fingerprint_hex == $h)][0] | "status=\(.status) valid \(.valid_from)..\(.valid_until)\(if .entry_error != "" then " (" + .entry_error + ")" else "" end)"' "$W/keys.json")"
+            fi
+          fi
+        else
+          # no hint: try every usable key
+          state="signature-invalid"; det="bundle has no public key hint; no usable trusted key verified it"
+          local k pem
+          for k in $(jq -r --arg at "$AT" "$KEY_STATE_JQ"' to_entries[] | select(.value | kstate($at) == "usable") | .key' "$W/keys.json"); do
+            pem="$(jq -r ".[$k].pem" "$W/keys.json")"
+            if cosign verify-blob --key "$pem" --bundle "$b" --insecure-ignore-tlog "$G" >/dev/null 2>&1; then
+              kid="$(jq -r ".[$k].id" "$W/keys.json")"; state="verified"; det=""; break
+            fi
+          done
+        fi
+      fi
+      if [ "$state" = verified ]; then
+        ok_any=1; printf '%s\n' "$kid" >> "$W/verified"
+        chk PASS "bundle $fname" "key=$kid verified"
+      else
+        chk INFO "bundle $fname" "key=${kid:-?} $state${det:+ — $det}"
+      fi
+      jq -cn --arg f "$fname" --arg k "$kid" --arg s "$state" --arg d "$det" '{file:$f, key_id:$k, status:$s, detail:$d}' >> "$W/bundles.jsonl"
+    done
+    if [ "$nb" = 0 ]; then chk FAIL signature "no gate.json.<keyid>.sigstore.json bundle in $DIR"
+    elif [ "$ok_any" = 1 ]; then chk PASS signature "verified by $(sort -u "$W/verified" | tr '\n' ' ')(trusted keys: $TKF)"
+    else chk FAIL signature "none of $nb bundle(s) verified with a usable trusted key: $(jq -r -s 'map("\(.file)=\(.status)") | join(", ")' "$W/bundles.jsonl")"; fi
+  fi
+
+  # (5) gate result
+  local res
+  res="$(jq -r '.result // ""' "$G")"
+  if [ "$res" = PASS ]; then chk PASS gate-result "gate.json result PASS"
+  elif [ "$ALLOW_FAIL" = 1 ]; then chk WARN gate-result "gate.json result $res accepted by --allow-fail-result (signed evidence of a FAILED gate)"
+  else chk FAIL gate-result "gate.json result is '$res' (a signed FAIL is evidence of a failed gate, not a releasable build; --allow-fail-result to accept)"; fi
+  finish
+}
+
+# ── verify-toolkit (RQ1, RQ2) ────────────────────────────────────────────────
+# cosign 3.x with a key and no transparency log (measured against registry:2, see docs):
+#   cosign verify --key PEM --insecure-ignore-tlog REF@sha256:...
+#   cosign verify-attestation --key PEM --insecure-ignore-tlog --type cyclonedx REF@sha256:...
+cmd_verify_toolkit() {
+  local IMG="" TK="" AT="$TODAY" JSON=0 ATT=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --image) IMG="$2"; shift 2;; --trusted-keys) TK="$2"; shift 2;; --at) AT="$2"; shift 2;;
+      --attestation) ATT=1; shift;; --json) JSON=1; shift;; -h|--help) usage; exit 0;;
+      *) die "unknown argument: $1";;
+    esac
+  done
+  [ -n "$IMG" ] || die "--image REF@sha256:<digest> is required"
+  printf '%s' "$IMG" | grep -Eq '@sha256:[0-9a-f]{64}$' || die "--image $IMG: pin the digest (REF@sha256:<64 hex>); a tag-only reference is not verifiable"
+  is_date "$AT" || die "--at must be YYYY-MM-DD (got '$AT')"
+  need jq; need cosign
+  local W; W="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$W'" EXIT
+  local TKF k id pem sig_ok="" att_ok="" tried=""
+  TKF="$(resolve_trusted_keys "$TK")"
+  load_trusted_keys "$TKF" "$W"
+  for k in $(jq -r --arg at "$AT" "$KEY_STATE_JQ"' to_entries[] | select(.value | kstate($at) == "usable") | .key' "$W/keys.json"); do
+    id="$(jq -r ".[$k].id" "$W/keys.json")"; pem="$(jq -r ".[$k].pem" "$W/keys.json")"; tried="$tried $id"
+    if cosign verify --key "$pem" --insecure-ignore-tlog "$IMG" >"$W/v.out" 2>"$W/v.err"; then
+      sig_ok="$id"; log "PASS image signature: $IMG verified by key $id"
+      if [ "$ATT" = 1 ]; then
+        if cosign verify-attestation --key "$pem" --insecure-ignore-tlog --type cyclonedx "$IMG" >/dev/null 2>"$W/a.err"; then
+          att_ok="$id"; log "PASS cyclonedx attestation verified by key $id"
+        else
+          log "FAIL cyclonedx attestation with key $id: $(grep -v '^WARNING' "$W/a.err" | tail -1)"
+        fi
+      fi
+      break
+    else
+      log "key $id: $(grep -v '^WARNING' "$W/v.err" | tail -1)"
+    fi
+  done
+  local result=PASS
+  [ -n "$sig_ok" ] || result=FAIL
+  [ "$ATT" = 1 ] && [ -z "$att_ok" ] && result=FAIL
+  [ -n "$tried" ] || log "no usable trusted key at $AT in $TKF"
+  printf '%s verify-toolkit: %s%s\n' "$result" "$IMG" "${sig_ok:+ (key $sig_ok)}" >&2
+  if [ "$JSON" = 1 ]; then
+    jq -n --arg r "$result" --arg i "$IMG" --arg k "$sig_ok" --arg a "$att_ok" --argjson att "$ATT" --arg tk "$TKF" --arg at "$AT" \
+      '{result:$r, image:$i, key_id:$k, attestation:(if $att == 1 then {checked:true, key_id:$a} else {checked:false} end), trusted_keys:$tk, at:$at}'
+  fi
+  [ "$result" = PASS ]
+}
+
+# ── check-tools (RQ11) ───────────────────────────────────────────────────────
+lock_os() { case "$(host_os)" in macos) echo darwin;; *) host_os;; esac; }
+cmd_check_tools() {
+  local LOCK="$SBOMGATE_HOME/tools.lock" JSON=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --lock) LOCK="$2"; shift 2;; --json) JSON=1; shift;; -h|--help) usage; exit 0;; *) die "unknown argument: $1";; esac
+  done
+  [ -f "$LOCK" ] || die "tools.lock not found: $LOCK"
+  local os arch t T ver want p got status all=ok rows=""
+  os="$(lock_os)"; arch="$(host_arch)"
+  for t in syft grype trivy yq jq cosign; do
+    T="$(printf '%s' "$t" | tr '[:lower:]' '[:upper:]')"
+    ver="$(sed -n "s/^${T}_VERSION=//p" "$LOCK" | head -1)"
+    want="$(sed -n "s/^${T}_BIN_SHA256_${os}_${arch}=//p" "$LOCK" | head -1)"
+    p="$(command -v "$t" 2>/dev/null || true)"
+    [ -n "$p" ] && [ ! -f "$p" ] && [ -f "$p.exe" ] && p="$p.exe"
+    if [ -z "$p" ] || [ ! -f "$p" ]; then status=missing; got="-"
+    else
+      got="$(sha256_of "$p")"
+      if [ -n "$want" ] && [ "$got" = "$want" ]; then status=ok; else status=MISMATCH; fi
+    fi
+    [ "$status" = ok ] || all=fail
+    [ -z "$want" ] && printf '[sbomgate] no %s_BIN_SHA256_%s_%s in %s\n' "$T" "$os" "$arch" "$LOCK" >&2
+    [ "$status" = MISMATCH ] && [ -n "$want" ] && printf '[sbomgate] %s: %s sha256 %s, tools.lock wants %s\n' "$t" "$p" "$got" "$want" >&2
+    if [ "$JSON" = 1 ]; then printf '%s %s %s %s\n' "$status" "$t" "${ver:-?}" "$got" >&2; else printf '%s %s %s %s\n' "$status" "$t" "${ver:-?}" "$got"; fi
+    rows="$rows$(jq -cn --arg s "$status" --arg t "$t" --arg v "$ver" --arg g "$got" --arg w "$want" --arg p "$p" '{tool:$t, status:$s, version:$v, sha256:$g, expected:$w, path:$p}')
+"
+  done
+  if [ "$JSON" = 1 ]; then
+    printf '%s' "$rows" | jq -s --arg r "$all" --arg os "$os" --arg arch "$arch" --arg lock "$LOCK" '{result:$r, os:$os, arch:$arch, lock:$lock, tools:.}'
+  fi
+  [ "$all" = ok ]
+}
+
+# ── key-entry / key-status ───────────────────────────────────────────────────
+cmd_key_entry() {
+  local PUB="" ID="" PURPOSE="" DAYS="" FROM="$TODAY" NOTE=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pub) PUB="$2"; shift 2;; --id) ID="$2"; shift 2;; --purpose) PURPOSE="$2"; shift 2;;
+      --days) DAYS="$2"; shift 2;; --from) FROM="$2"; shift 2;; --note) NOTE="$2"; shift 2;;
+      -h|--help) usage; exit 0;; *) die "unknown argument: $1";;
+    esac
+  done
+  [ -f "$PUB" ] || die "--pub FILE (cosign.pub) is required"
+  printf '%s' "$ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || die "--id must match [A-Za-z0-9][A-Za-z0-9._-]* (got '$ID')"
+  case "$PURPOSE" in interim|hardware) ;; *) die "--purpose must be interim|hardware";; esac
+  case "$DAYS" in ''|*[!0-9]*) die "--days N is required (interim keys: 90, RQ16)";; esac
+  is_date "$FROM" || die "--from must be YYYY-MM-DD"
+  local fp until
+  fp="$(pem_fingerprint < "$PUB")"; [ -n "$fp" ] || die "$PUB has no PEM PUBLIC KEY block"
+  until="$(date_add_days "$FROM" "$DAYS")"
+  [ -n "$NOTE" ] || NOTE="$PURPOSE key"
+  printf '  - id: %s\n    purpose: %s\n    status: active\n    fingerprint: sha256:%s\n    valid_from: %s\n    valid_until: %s\n' "$ID" "$PURPOSE" "$fp" "$FROM" "$until"
+  printf '    revoked_on: ""\n    extended_on: ""\n    extension_reason: ""\n    note: %s\n    public_key: |\n' "$(jq -n --arg n "$NOTE" '$n')"
+  sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' "$PUB" | sed 's/^/      /'
+}
+cmd_key_status() {  # is the key in PUB a usable trusted key at --at? exit 0 usable, 1 otherwise
+  local PUB="" TK="" AT="$TODAY" JSON=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pub) PUB="$2"; shift 2;; --trusted-keys) TK="$2"; shift 2;; --at) AT="$2"; shift 2;;
+      --json) JSON=1; shift;; -h|--help) usage; exit 0;; *) die "unknown argument: $1";;
+    esac
+  done
+  [ -f "$PUB" ] || die "--pub FILE is required"
+  is_date "$AT" || die "--at must be YYYY-MM-DD (got '$AT')"
+  local W fp TKF out
+  W="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$W'" EXIT
+  fp="$(pem_fingerprint < "$PUB")"; [ -n "$fp" ] || die "$PUB has no PEM PUBLIC KEY block"
+  TKF="$(resolve_trusted_keys "$TK")"
+  load_trusted_keys "$TKF" "$W"
+  out="$(jq -c --arg h "$fp" --arg at "$AT" --arg tk "$TKF" "$KEY_STATE_JQ"'
+    ([.[] | select(.fingerprint_hex == $h)][0]) as $k
+    | if $k == null then {state:"key-unknown", id:"", fingerprint:("sha256:" + $h), trusted_keys:$tk, at:$at}
+      else {state:($k | kstate($at)), id:$k.id, purpose:$k.purpose, status:$k.status, valid_from:$k.valid_from, valid_until:$k.valid_until,
+            fingerprint:("sha256:" + $h), trusted_keys:$tk, at:$at} end' "$W/keys.json")"
+  if [ "$JSON" = 1 ]; then printf '%s\n' "$out"; else jq -r '"\(.state) \(if .id == "" then "-" else .id end) \(.fingerprint)"' <<<"$out"; fi
+  [ "$(jq -r .state <<<"$out")" = usable ]
+}
+
 case "${1:-help}" in
   scan) shift; cmd_scan "$@";;
+  verify-release) shift; cmd_verify_release "$@";;
+  verify-toolkit) shift; cmd_verify_toolkit "$@";;
+  check-tools) shift; cmd_check_tools "$@";;
+  key-entry) shift; cmd_key_entry "$@";;
+  key-status) shift; cmd_key_status "$@";;
   tools) tool_versions_json;;
   version) printf '%s\n' "$TOOLKIT_VERSION";;
   help|-h|--help) usage;;

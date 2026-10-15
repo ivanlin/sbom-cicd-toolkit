@@ -1,4 +1,7 @@
 # .github/workflows/sbom-cicd.yml — drop-in for any repo. Source scan via the reusable workflow.
+# The workflow pulls the toolkit by digest, verifies its signature (verify-toolkit), then scans.
+# Get the digest of a release with:
+#   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.2.0
 name: sbom-cicd
 on:
   push: { branches: [ main ] }
@@ -7,8 +10,9 @@ on:
 permissions: { contents: read }
 jobs:
   sbom-cve-gate:
-    uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.1.0
+    uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.2.0
     with:
       name: my-project           # artifact / SBOM name
       source: .                  # directory to scan (repo-relative)
-      fail_on: HIGH          # CRITICAL | HIGH | MEDIUM | LOW | none
+      fail_on: HIGH              # CRITICAL | HIGH | MEDIUM | LOW | none
+      toolkit_image: ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>   # pin by digest

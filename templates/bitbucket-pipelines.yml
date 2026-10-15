@@ -1,0 +1,76 @@
+# bitbucket-pipelines.yml — SBOM + CVE gate for a Bitbucket Cloud repo (source scan).
+# Copy to the repo root as `bitbucket-pipelines.yml`, change NAME, enable Pipelines.
+#
+# This file only ADAPTS Bitbucket to the toolkit container (RQ12/RQ13): every judgment (SBOM, CVE
+# match, threshold, exemptions, gate.json) happens inside the image. The container reads no
+# Bitbucket variables — the commit and remote URL are handed over as plain CLI arguments.
+#
+# Toolkit image: pinned by DIGEST, never by tag. Get the digest of a release with
+#   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.2.0
+# (the "Digest:" line of the index) and paste it below. Bump deliberately (docs/RELEASING.md).
+#
+# Measured Bitbucket limits (2026-10): a 1x step has 4096 MB in total and the docker service gets
+# 1024 MB by default (max 3072 MB). The scanners need more than 1 GB, hence size: 2x + 3072 MB.
+# Bitbucket only allows `docker run -v` bind mounts under $BITBUCKET_CLONE_DIR, so the output
+# directory lives inside the clone and is hidden from the scan via .git/info/exclude.
+image: atlassian/default-image:4
+
+definitions:
+  services:
+    docker:
+      memory: 3072
+  steps:
+    - step: &sbom-gate
+        name: SBOM + CVE gate (sbom-cicd-toolkit)
+        size: 2x
+        services: [ docker ]
+        script:
+          - export TOOLKIT="ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>"
+          - export NAME="my-project"        # SBOM / artifact name
+          - export FAIL_ON="HIGH"           # project floor is HIGH (policy/gate-policy.md)
+          - case "$TOOLKIT" in *'<'*) echo "TOOLKIT still holds the placeholder - paste the release digest" >&2; exit 1;; *@sha256:*) ;; *) echo "TOOLKIT must be pinned as image@sha256:<digest>" >&2; exit 1;; esac
+          - docker pull "$TOOLKIT"
+          - >-
+            docker run --rm "$TOOLKIT" verify-toolkit --image "$TOOLKIT"
+            || { echo "toolkit image signature NOT verified against the trusted keys - refusing to scan (exit 1, do not 'fix' the code)" >&2; exit 1; }
+          - mkdir -p sbom-out && chmod 0777 sbom-out
+          - echo "sbom-out/" >> .git/info/exclude
+          - >-
+            docker run --rm -e SBOMGATE_IMAGE_DIGEST="$TOOLKIT"
+            -v "$BITBUCKET_CLONE_DIR:/src:ro" -v "$BITBUCKET_CLONE_DIR/sbom-out:/out"
+            "$TOOLKIT" scan --source /src --name "$NAME" --out /out --fail-on "$FAIL_ON"
+            --source-url "$BITBUCKET_GIT_HTTP_ORIGIN" --source-ref "$BITBUCKET_COMMIT"
+        after-script:
+          # exit 0 = PASS · 2 = gate FAIL · 1 = tool/policy/verification error
+          - cat sbom-out/summary.md 2>/dev/null || echo "no summary.md (scan did not run to the end)"
+        artifacts:
+          - sbom-out/**
+
+pipelines:
+  default:
+    - step: *sbom-gate
+  pull-requests:
+    '**':
+      - step: *sbom-gate
+  custom:
+    # RQ14 consistency test: run the toolkit's own fixtures on Bitbucket (manual trigger:
+    # Pipelines -> Run pipeline -> custom: fixtures). Compare the CycloneDX component set with the
+    # GitHub platform-matrix artifacts using scripts/consistency-compare.sh (only components are
+    # compared; vulnerability results and file hashes may differ).
+    fixtures:
+      - step:
+          name: toolkit fixtures (vuln-app -> 2, clean-app -> 0)
+          size: 2x
+          services: [ docker ]
+          script:
+            - export TOOLKIT="ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>"
+            - export TOOLKIT_TAG="v1.2.0"   # the git tag that produced the digest above
+            - docker pull "$TOOLKIT"
+            - >-
+              docker run --rm "$TOOLKIT" verify-toolkit --image "$TOOLKIT"
+              || { echo "toolkit image signature NOT verified - refusing to run fixtures" >&2; exit 1; }
+            - git clone --quiet --depth 1 --branch "$TOOLKIT_TAG" https://github.com/ivanlin/sbom-cicd-toolkit.git sbom-cicd-toolkit-src
+            - mkdir -p sbom-fixtures/vuln sbom-fixtures/clean && chmod -R 0777 sbom-fixtures
+            - bash sbom-cicd-toolkit-src/scripts/fixtures-container.sh "$TOOLKIT" "bitbucket-pipelines/linux-amd64/container" sbom-fixtures
+          artifacts:
+            - sbom-fixtures/**

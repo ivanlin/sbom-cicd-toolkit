@@ -1,0 +1,35 @@
+# trusted-keys.yaml — the public keys whose signatures sbomgate verify-release / verify-toolkit
+# accept (RQ3). Shipped inside the toolkit image (/opt/sbom-cicd-toolkit/trusted-keys.yaml) and
+# the native install prefix; revocation propagates by releasing a new toolkit version (R3).
+#
+# Lookup order in sbomgate: --trusted-keys FILE > $SBOMGATE_TRUSTED_KEYS >
+#   $SBOMGATE_HOME/trusted-keys.yaml > $SBOMGATE_HOME/policy/trusted-keys.yaml
+#
+# A key is USABLE at date T (default: today UTC, override with --at YYYY-MM-DD) iff
+#   status == active  AND  valid_from <= T <= valid_until.
+# Revoked or expired keys are rejected with the reason (key-revoked / key-expired /
+# key-not-yet-valid). Every key MUST have valid_until (interim keys: 90 days, RQ16).
+#
+# Entry schema (generate one with:  sbomgate key-entry --pub cosign.pub --id interim-YYYY-MM --purpose interim --days 90):
+#   - id: interim-2026-10          # short stable id; used in bundle names gate.json.<id>.sigstore.json
+#     purpose: interim             # interim | hardware
+#     status: active               # active | revoked
+#     fingerprint: sha256:<hex>    # sha256 of the DER SubjectPublicKeyInfo
+#                                  #   openssl pkey -pubin -in cosign.pub -outform DER | shasum -a 256
+#                                  # must match public_key below (sbomgate refuses the entry otherwise)
+#     valid_from: 2026-10-16       # YYYY-MM-DD, inclusive
+#     valid_until: 2027-01-14      # YYYY-MM-DD, inclusive, REQUIRED
+#     revoked_on: ""               # YYYY-MM-DD when status becomes revoked
+#     extended_on: ""              # RQ16: one extension allowed before expiry; date of the extension
+#     extension_reason: ""         #       and why (both required when extended_on is set)
+#     note: "free text"
+#     public_key: |
+#       -----BEGIN PUBLIC KEY-----
+#       ...
+#       -----END PUBLIC KEY-----
+#
+# Rotation (RQ15): register the new (and backup) key here and release the toolkit FIRST,
+# re-sign still-valid evidence with `sbomsign <repo> --resign <tag>`, then mark the old key
+# revoked and release the toolkit again.
+version: 1
+keys: []

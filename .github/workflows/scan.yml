@@ -1,11 +1,18 @@
 # Reusable SBOM + CVE gate. Call it from any repo:
 #   jobs:
 #     gate:
-#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.1.0
+#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.2.0
 #       with:
 #         name: my-project
 #         source: .
 #         fail_on: HIGH
+#         toolkit_image: ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<digest from the release notes>
+#
+# The workflow only adapts GitHub to the toolkit container (RQ12/RQ13): pull by digest ->
+# verify-toolkit (signature against the trusted keys baked into the image) -> scan -> upload.
+# The container reads no GitHub variables; commit + remote URL are passed as CLI arguments.
+# Pass toolkit_image explicitly: a tagged copy of this file cannot contain the digest of the image
+# built from that same tag, so the default below is only a placeholder that fails loudly.
 name: sbom-cve-gate (reusable)
 on:
   workflow_call:
@@ -27,7 +34,9 @@ on:
         default: false
       toolkit_image:
         type: string
-        default: "ghcr.io/ivanlin/sbom-cicd-toolkit:1.1.0"
+        # get it with: docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.2.0
+        default: "ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>"
+        description: "toolkit image pinned by digest (image@sha256:...); a tag-only ref is refused"
     outputs:
       result:
         value: ${{ jobs.gate.outputs.result }}
@@ -41,24 +50,40 @@ jobs:
     outputs:
       result: ${{ steps.scan.outputs.result }}
       digest: ${{ steps.pull.outputs.digest }}
+    env:
+      TOOLKIT: ${{ inputs.toolkit_image }}
+      GATE_NAME: ${{ inputs.name }}
+      GATE_SOURCE: ${{ inputs.source }}
+      GATE_FAIL_ON: ${{ inputs.fail_on }}
+      GATE_ONLY_FIXED: ${{ inputs.only_fixed }}
     steps:
       - uses: actions/checkout@v4
       - id: pull
-        name: Pull the pinned toolkit image and record its digest
+        name: Pull the toolkit image by digest
         run: |
-          docker pull "${{ inputs.toolkit_image }}"
-          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "${{ inputs.toolkit_image }}")"
-          echo "digest=$digest" | tee -a "$GITHUB_OUTPUT"
+          case "$TOOLKIT" in
+            *'<'*)      echo "::error::toolkit_image still holds the placeholder; pass toolkit_image: ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<digest> (see the release notes)"; exit 1;;
+            *@sha256:*) ;;
+            *)          echo "::error::toolkit_image must be pinned by digest (image@sha256:...), got: $TOOLKIT"; exit 1;;
+          esac
+          docker pull "$TOOLKIT"
+          echo "digest=$TOOLKIT" | tee -a "$GITHUB_OUTPUT"
+      - name: Verify the toolkit image signature (trusted keys, no provider API)
+        run: |
+          docker run --rm "$TOOLKIT" verify-toolkit --image "$TOOLKIT" || {
+            echo "::error::toolkit image signature NOT verified against the trusted keys - refusing to scan (verification error = exit 1; do not 'fix' the code)"
+            exit 1; }
       - id: scan
         name: SBOM (CycloneDX+SPDX) + CVE scan (grype, trivy) + gate
         run: |
           mkdir -p "$RUNNER_TEMP/out"
-          extra=""; [ "${{ inputs.only_fixed }}" = "true" ] && extra="--only-fixed"
+          extra=""; [ "$GATE_ONLY_FIXED" = "true" ] && extra="--only-fixed"
           set +e
-          docker run --rm -e SBOMGATE_IMAGE_DIGEST="${{ steps.pull.outputs.digest }}" \
-            -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/out:/out" "${{ inputs.toolkit_image }}" \
-            scan --source "/src/${{ inputs.source }}" --name "${{ inputs.name }}" --out /out \
-                 --fail-on "${{ inputs.fail_on }}" $extra
+          docker run --rm -e SBOMGATE_IMAGE_DIGEST="$TOOLKIT" \
+            -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/out:/out" "$TOOLKIT" \
+            scan --source "/src/$GATE_SOURCE" --name "$GATE_NAME" --out /out \
+                 --fail-on "$GATE_FAIL_ON" $extra \
+                 --source-url "https://github.com/${{ github.repository }}" --source-ref "${{ github.sha }}"
           code=$?
           set -e
           echo "result=$(jq -r .result "$RUNNER_TEMP/out/gate.json" 2>/dev/null || echo ERROR)" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# sbomsign — scan a commit and sign its gate.json with the operator's key (mac mini, D2/D4).
+# Host-side; bash 3.2 compatible. No Rekor / Fulcio / keyless anywhere (D3).
+#
+#   sbomsign <repo-url-or-path> <rev> [--key URI] [--mode docker|native] [--image REF@sha256:...]
+#            [--name N] [--tag T] [--fail-on HIGH] [--image-tar FILE] [--allowlist FILE]
+#            [--out DIR] [--no-publish] [--evidence-branch sbom-evidence] [--push-remote URL]
+#            [--sign-failed] [--log FILE] [--trusted-keys F] [--slot SLOT]
+#   sbomsign <repo-url-or-path> --resign <tag> [--key URI] [--evidence-branch sbom-evidence]
+#            [--push-remote URL] [--no-publish] [--out DIR] [--log FILE] [--trusted-keys F]
+#
+#   --key   default $SBOMSIGN_KEY: a file path (or file://path), a pkcs11: / KMS URI passed to cosign
+#           unchanged, or the literal "sk" (YubiKey PIV via cosign --sk, optional --slot).
+#           File-key password: $COSIGN_PASSWORD, else (macOS) Keychain item
+#           ${SBOMSIGN_KEYCHAIN_ITEM:-sbom-signing-key}, else cosign prompts (needs a terminal).
+#   --image default $SBOMSIGN_IMAGE; must be pinned by digest; verified with verify-toolkit before use.
+#   --out   default ./sbom-evidence/<tag>; must not exist; populated only after the signature verifies.
+#   --log   default $SBOMSIGN_LOG or ~/.sbom-cicd/sbom-signing-log.jsonl (one JSON line per run, RQ7).
+#
+# Steps: 0 key-carrier/trust check · 1 git fetch · 2 scan · 3 pre-sign checks · 4 sign · 5 verify ·
+#        6 publish to the orphan evidence branch · 7 log. Any failure aborts with nothing left behind
+#        except an "aborted" log line (RQ5).
+# Exit: 0 ok · 1 any failure · 2 gate FAIL (without --sign-failed).
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+SBOMGATE_HOME="${SBOMGATE_HOME:-$(cd "$SELF_DIR/.." && pwd)}"
+export SBOMGATE_HOME
+SBOMGATE="${SBOMSIGN_SBOMGATE:-$SELF_DIR/sbomgate}"
+[ -x "$SBOMGATE" ] || SBOMGATE="$(command -v sbomgate 2>/dev/null || true)"
+
+info() { printf '[sbomsign %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+usage_die() { printf '[sbomsign] ERROR: %s\n' "$*" >&2; exit 1; }
+strip_userinfo() { printf '%s' "$1" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@#\1#'; }
+sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+abspath() { ( cd "$(dirname "$1")" && printf '%s/%s\n' "$(pwd)" "$(basename "$1")" ); }
+
+# ── arguments ────────────────────────────────────────────────────────────────
+REPO="" REV="" RESIGN="" KEY="${SBOMSIGN_KEY:-}" SLOT="" MODE="docker" IMAGE="${SBOMSIGN_IMAGE:-}" NAME="" TAG_OPT=""
+FAIL_ON="HIGH" IMAGE_TAR="" ALLOWLIST="" OUTDIR="" NO_PUBLISH=0 BRANCH="sbom-evidence" PUSH_REMOTE="" SIGN_FAILED=0
+LOGF="${SBOMSIGN_LOG:-${HOME}/.sbom-cicd/sbom-signing-log.jsonl}" TK=""
+POS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --key) KEY="$2"; shift 2;; --slot) SLOT="$2"; shift 2;; --mode) MODE="$2"; shift 2;;
+    --image) IMAGE="$2"; shift 2;; --name) NAME="$2"; shift 2;; --tag) TAG_OPT="$2"; shift 2;;
+    --fail-on) FAIL_ON="$2"; shift 2;; --image-tar) IMAGE_TAR="$2"; shift 2;; --allowlist) ALLOWLIST="$2"; shift 2;;
+    --out) OUTDIR="$2"; shift 2;; --no-publish) NO_PUBLISH=1; shift;; --evidence-branch) BRANCH="$2"; shift 2;;
+    --push-remote) PUSH_REMOTE="$2"; shift 2;; --sign-failed) SIGN_FAILED=1; shift;; --log) LOGF="$2"; shift 2;;
+    --trusted-keys) TK="$2"; shift 2;; --resign) RESIGN="$2"; shift 2;;
+    -h|--help) usage; exit 0;;
+    --*) usage_die "unknown option: $1 (see --help)";;
+    *) POS+=("$1"); shift;;
+  esac
+done
+[ "${#POS[@]}" -ge 1 ] || usage_die "missing <repo-url-or-path> (see --help)"
+REPO="${POS[0]}"
+if [ -n "$RESIGN" ]; then
+  [ "${#POS[@]}" -eq 1 ] || usage_die "--resign takes no <rev> argument"
+else
+  [ "${#POS[@]}" -eq 2 ] || usage_die "usage: sbomsign <repo-url-or-path> <rev> [options] (see --help)"
+  REV="${POS[1]}"
+fi
+case "$MODE" in docker|native) ;; *) usage_die "--mode must be docker|native";; esac
+[ -n "$TK" ] && { [ -f "$TK" ] || usage_die "--trusted-keys $TK not found"; TK="$(abspath "$TK")"; }
+TK_ARGS=(); [ -n "$TK" ] && TK_ARGS=(--trusted-keys "$TK")
+
+# ── run state + atomic abort (RQ5) ───────────────────────────────────────────
+ACTION="sign"; [ -n "$RESIGN" ] && ACTION="resign"
+STAGE="preflight" SHA="" TAG="${RESIGN:-}" GATE_SHA="" KEY_ID="" KEY_FP="" BUNDLE="" EVID_COMMIT="" RESIGN_OF=""
+TOOLKIT_VERSION="" REMOTE_URL="" GATE_RESULT="" NOTE="" WORK="" OUT_PARTIAL="" OUT_CREATED=0 LOGGED=0 DONE=0
+ABORT_CODE=1
+write_log() {  # $1 result  $2 reason
+  local d; d="$(dirname "$LOGF")"
+  mkdir -p "$d" 2>/dev/null || true
+  jq -cn --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg action "$ACTION" --arg repo "${REMOTE_URL:-$REPO}" --arg sha "$SHA" \
+     --arg tag "$TAG" --arg gs "$GATE_SHA" --arg kid "$KEY_ID" --arg kfp "$KEY_FP" --arg bundle "$BUNDLE" \
+     --arg br "$BRANCH" --arg ec "$EVID_COMMIT" --arg img "$IMAGE" --arg tv "$TOOLKIT_VERSION" --arg result "$1" \
+     --arg stage "$STAGE" --arg reason "${2:-}" --arg ro "$RESIGN_OF" --arg gr "$GATE_RESULT" --arg note "$NOTE" \
+     --arg mode "$MODE" --arg out "$OUTDIR" --argjson pub "$([ "$NO_PUBLISH" = 1 ] && echo false || echo true)" '
+     {time:$time, action:$action, repo:$repo, sha:$sha, tag:$tag, gate_sha256:$gs, key_id:$kid, key_fingerprint:$kfp,
+      bundle:$bundle, evidence_branch:$br, evidence_commit:$ec, toolkit_image:$img, toolkit_version:$tv, result:$result,
+      mode:$mode, published:$pub, out:$out}
+     + (if $result != "ok" then {stage:$stage, reason:$reason} else {} end)
+     + (if $ro != "" then {resign_of:$ro} else {} end)
+     + (if $gr != "" then {gate_result:$gr} else {} end)
+     + (if $note != "" then {note:$note} else {} end)' >> "$LOGF" 2>/dev/null \
+    || printf '[sbomsign] WARNING: could not append to log %s\n' "$LOGF" >&2
+  LOGGED=1
+}
+abort() {
+  printf '[sbomsign] ERROR: %s\n' "$*" >&2
+  write_log aborted "$*"
+  exit "$ABORT_CODE"
+}
+on_exit() {
+  local rc=$?
+  [ -n "$WORK" ] && rm -rf "$WORK"
+  [ -n "$OUT_PARTIAL" ] && rm -rf "$OUT_PARTIAL"
+  if [ "$DONE" != 1 ]; then
+    [ "$OUT_CREATED" = 1 ] && [ -n "$OUTDIR" ] && rm -rf "$OUTDIR"
+    if [ "$LOGGED" != 1 ]; then
+      printf '[sbomsign] ERROR: unexpected failure at stage %s (exit %s)\n' "$STAGE" "$rc" >&2
+      write_log aborted "unexpected failure (exit $rc)"
+    fi
+    [ "$rc" = 0 ] && rc=1
+  fi
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT TERM
+
+need() { command -v "$1" >/dev/null 2>&1 || abort "required tool not on PATH: $1"; }
+lockval() { sed -n "s/^$1=//p" "$SBOMGATE_HOME/tools.lock" 2>/dev/null | head -1; }
+
+# ── step 0: tools, key carrier, trust (RQ6, RQ15, RQ18) — before any clone/scan ─
+need git; need jq; need yq; need cosign
+[ -n "$SBOMGATE" ] && [ -x "$SBOMGATE" ] || abort "sbomgate not found next to sbomsign or on PATH"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/sbomsign.XXXXXX")"
+TOOLKIT_VERSION="$("$SBOMGATE" version 2>/dev/null || true)"
+COSIGN_WANT="$(lockval COSIGN_VERSION)"
+[ -n "$COSIGN_WANT" ] || abort "COSIGN_VERSION missing in $SBOMGATE_HOME/tools.lock"
+COSIGN_GOT="$(cosign version --json 2>/dev/null | jq -r '.gitVersion // empty' 2>/dev/null | sed 's/^v//' || true)"
+[ "$COSIGN_GOT" = "$COSIGN_WANT" ] || abort "cosign ${COSIGN_GOT:-unknown} on PATH but tools.lock pins $COSIGN_WANT (RQ18: signer and verifier use the same cosign)"
+if [ -z "$RESIGN" ] && [ "$MODE" = docker ]; then
+  need docker
+  [ -n "$IMAGE" ] || abort "--mode docker needs --image REF@sha256:<digest> (or SBOMSIGN_IMAGE)"
+  printf '%s' "$IMAGE" | grep -Eq '@sha256:[0-9a-f]{64}$' || abort "--image $IMAGE: pin the digest (REF@sha256:<64 hex>)"
+fi
+[ -z "$IMAGE_TAR" ] || { [ -f "$IMAGE_TAR" ] || abort "--image-tar $IMAGE_TAR not found"; IMAGE_TAR="$(abspath "$IMAGE_TAR")"; }
+[ -z "$ALLOWLIST" ] || { [ -f "$ALLOWLIST" ] || abort "--allowlist $ALLOWLIST not found"; ALLOWLIST="$(abspath "$ALLOWLIST")"; }
+if [ -n "$OUTDIR" ]; then
+  case "$OUTDIR" in /*) ;; *) OUTDIR="$PWD/$OUTDIR";; esac
+  [ ! -e "$OUTDIR" ] || abort "--out $OUTDIR already exists; refusing to overwrite evidence"
+fi
+
+STAGE="key-carrier"
+KEY_ARGS=()
+case "$KEY" in
+  "") abort "no signing key: pass --key URI or set SBOMSIGN_KEY";;
+  sk) KEY_ARGS=(--sk); [ -z "$SLOT" ] || KEY_ARGS+=(--slot "$SLOT");;
+  file://*|/*|./*|../*|~*|[!a-z]*) KEY_KIND="file";;
+  *:*) KEY_ARGS=(--key "$KEY");;       # pkcs11:, awskms://, gcpkms://, hashivault://, azurekms://, k8s:// ... unchanged (D1)
+  *) KEY_KIND="file";;
+esac
+if [ "${KEY_KIND:-}" = file ]; then
+  KPATH="${KEY#file://}"
+  [ -f "$KPATH" ] && [ -r "$KPATH" ] || abort "signing key file not available: $KPATH (key carrier missing or unreadable)"
+  KEY_ARGS=(--key "$KPATH")
+  if [ -z "${COSIGN_PASSWORD+set}" ]; then
+    ITEM="${SBOMSIGN_KEYCHAIN_ITEM:-sbom-signing-key}"
+    if [ "$(uname -s)" = Darwin ] && command -v security >/dev/null 2>&1; then
+      COSIGN_PASSWORD="$(security find-generic-password -s "$ITEM" -w 2>/dev/null)" \
+        || abort "COSIGN_PASSWORD is not set and macOS Keychain item '$ITEM' is not readable"
+      export COSIGN_PASSWORD
+    elif [ ! -t 0 ]; then
+      abort "COSIGN_PASSWORD is not set and there is no terminal for cosign to prompt for the key password"
+    fi
+  fi
+fi
+STAGE="key-carrier"
+if ! cosign public-key "${KEY_ARGS[@]}" --outfile "$WORK/signer.pub" >/dev/null 2>"$WORK/pk.err"; then
+  err="$(grep -v '^WARNING' "$WORK/pk.err" | tail -1)"
+  if [ "$KEY" = sk ]; then abort "YubiKey not present: $err"; fi
+  abort "signing key $KEY is not usable (wrong password or unavailable carrier): $err"
+fi
+STAGE="trust"
+"$SBOMGATE" key-status --pub "$WORK/signer.pub" ${TK_ARGS[@]+"${TK_ARGS[@]}"} --json > "$WORK/ks.json" 2>"$WORK/ks.err" || true
+KEY_FP="$(jq -r '.fingerprint // ""' "$WORK/ks.json" 2>/dev/null || true)"
+KSTATE="$(jq -r '.state // ""' "$WORK/ks.json" 2>/dev/null || true)"
+if [ "$KSTATE" != usable ]; then
+  [ -s "$WORK/ks.err" ] && cat "$WORK/ks.err" >&2
+  abort "signing key ${KEY_FP:-?} is not a usable trusted key (${KSTATE:-error}) — register it in trusted-keys.yaml and release the toolkit first (RQ15)"
+fi
+KEY_ID="$(jq -r .id "$WORK/ks.json")"
+BUNDLE="gate.json.$KEY_ID.sigstore.json"
+info "signing key $KEY_ID ($KEY_FP) is usable; cosign $COSIGN_GOT"
+
+PUSH="${PUSH_REMOTE:-$REPO}"
+[ -d "$PUSH" ] && PUSH="$(cd "$PUSH" && pwd)"
+# evidence_checkout DIR: fresh repo whose HEAD is the evidence branch (existing tip, or an unborn orphan)
+EVID_EXISTS=0
+evidence_checkout() {
+  local d="$1" rc=0
+  git init -q "$d"
+  git ls-remote --exit-code "$PUSH" "refs/heads/$BRANCH" >/dev/null 2>"$WORK/lsr.err" || rc=$?
+  if [ "$rc" = 0 ]; then
+    git -C "$d" fetch -q "$PUSH" "refs/heads/$BRANCH" 2>"$WORK/fetch.err" || abort "cannot fetch $BRANCH from $PUSH: $(tail -1 "$WORK/fetch.err")"
+    git -C "$d" checkout -q -B "$BRANCH" FETCH_HEAD
+    EVID_EXISTS=1
+  elif [ "$rc" = 2 ]; then
+    git -C "$d" symbolic-ref HEAD "refs/heads/$BRANCH"
+    EVID_EXISTS=0
+  else
+    abort "cannot reach evidence remote $PUSH: $(tail -1 "$WORK/lsr.err")"
+  fi
+}
+verify_release() {  # $1 dir, rest: extra args; writes $WORK/vr.json; returns verify-release's exit code
+  local d="$1"; shift
+  "$SBOMGATE" verify-release --bundle-dir "$d" ${TK_ARGS[@]+"${TK_ARGS[@]}"} --json "$@" > "$WORK/vr.json"
+}
+cosign_sign() {  # sign $WORK/out/gate.json -> $WORK/out/$BUNDLE
+  STAGE="sign"
+  [ ! -e "$WORK/out/$BUNDLE" ] || abort "$BUNDLE already exists for $TAG (this key already signed it)"
+  cosign sign-blob "${KEY_ARGS[@]}" --use-signing-config=false --tlog-upload=false \
+      --bundle "$WORK/out/$BUNDLE" --yes "$WORK/out/gate.json" >/dev/null 2>"$WORK/sign.err" \
+    || abort "cosign sign-blob failed: $(grep -v -e '^WARNING' -e 'deprecated' "$WORK/sign.err" | tail -1)"
+  info "signed gate.json -> $BUNDLE"
+}
+populate_out() {  # copy $WORK/out to --out atomically (partial dir + rename)
+  STAGE="out"
+  [ -n "$OUTDIR" ] || OUTDIR="$PWD/sbom-evidence/$TAG"
+  [ ! -e "$OUTDIR" ] || abort "--out $OUTDIR already exists; refusing to overwrite evidence"
+  mkdir -p "$(dirname "$OUTDIR")"
+  OUT_PARTIAL="$OUTDIR.partial.$$"
+  cp -R "$WORK/out" "$OUT_PARTIAL"
+  mv "$OUT_PARTIAL" "$OUTDIR"; OUT_PARTIAL=""; OUT_CREATED=1
+  info "evidence written to $OUTDIR"
+}
+ALLOW_FAIL_ARGS=()
+
+if [ -z "$RESIGN" ]; then
+  # ── step 1: fetch (RQ4) ────────────────────────────────────────────────────
+  STAGE="fetch"
+  if [ -d "$REPO" ]; then
+    CLONE_SRC="$(cd "$REPO" && pwd)"
+    REMOTE_URL="$(git -C "$CLONE_SRC" remote get-url origin 2>/dev/null || printf '%s' "$CLONE_SRC")"
+  else
+    CLONE_SRC="$REPO"; REMOTE_URL="$REPO"
+  fi
+  REMOTE_URL="$(strip_userinfo "$REMOTE_URL")"
+  git clone --quiet --no-checkout "$CLONE_SRC" "$WORK/src" 2>"$WORK/clone.err" || abort "git clone $REPO failed: $(tail -1 "$WORK/clone.err")"
+  SHA="$(git -C "$WORK/src" rev-parse -q --verify "$REV^{commit}" 2>/dev/null || git -C "$WORK/src" rev-parse -q --verify "origin/$REV^{commit}" 2>/dev/null || true)"
+  [ -n "$SHA" ] || abort "revision '$REV' not found in $REPO"
+  git -C "$WORK/src" checkout --quiet --detach "$SHA"
+  if [ -n "$TAG_OPT" ]; then TAG="$TAG_OPT"
+  elif git -C "$WORK/src" rev-parse -q --verify "refs/tags/$REV" >/dev/null 2>&1; then TAG="$REV"
+  else TAG="$(git -C "$WORK/src" describe --tags --exact-match HEAD 2>/dev/null || printf 'sha-%s' "${SHA:0:12}")"; fi
+  git check-ref-format "refs/tags/$TAG" || abort "tag '$TAG' is not a valid ref name"
+  [ -n "$NAME" ] || NAME="$(basename "${CLONE_SRC%/}" .git | sed 's/[^A-Za-z0-9._-]/_/g')"
+  info "source $REMOTE_URL @ $SHA (tag $TAG, name $NAME)"
+  [ -n "$OUTDIR" ] || OUTDIR="$PWD/sbom-evidence/$TAG"
+  [ ! -e "$OUTDIR" ] || abort "--out $OUTDIR already exists; refusing to overwrite evidence"
+  if [ "$NO_PUBLISH" = 0 ]; then
+    evidence_checkout "$WORK/pre"
+    [ ! -e "$WORK/pre/$TAG/gate.json" ] || abort "evidence for $TAG already published on $BRANCH; use --resign or a different --tag"
+    rm -rf "$WORK/pre"
+  fi
+
+  # ── step 2: scan ───────────────────────────────────────────────────────────
+  mkdir -p "$WORK/out"
+  SCAN_ARGS=(--name "$NAME" --label "$TAG" --source-url "$REMOTE_URL" --source-ref "$REV" --fail-on "$FAIL_ON")
+  scan_rc=0
+  if [ "$MODE" = docker ]; then
+    STAGE="verify-toolkit"
+    # host-side verification (host cosign + host trusted keys): an image cannot vouch for itself
+    "$SBOMGATE" verify-toolkit --image "$IMAGE" ${TK_ARGS[@]+"${TK_ARGS[@]}"} >&2 \
+      || abort "toolkit image $IMAGE failed signature verification (RQ2)"
+    STAGE="scan"
+    DARGS=(run --rm -v "$WORK/src:/src:ro" -v "$WORK/out:/out" -e "SBOMGATE_IMAGE_DIGEST=${IMAGE##*@}")
+    if [ "$(uname -s)" = Linux ]; then DARGS+=(--user "$(id -u):$(id -g)" -v "sbomgate-cache-$(id -u):/cache"); else DARGS+=(-v "sbomgate-cache:/cache"); fi
+    [ -z "$IMAGE_TAR" ] || { DARGS+=(-v "$IMAGE_TAR:/in/image.tar:ro"); SCAN_ARGS+=(--image-tar /in/image.tar); }
+    [ -z "$ALLOWLIST" ] || { DARGS+=(-v "$ALLOWLIST:/in/allowlist.yaml:ro"); SCAN_ARGS+=(--allowlist /in/allowlist.yaml); }
+    docker "${DARGS[@]}" "$IMAGE" scan --source /src --out /out "${SCAN_ARGS[@]}" >&2 || scan_rc=$?
+  else
+    STAGE="check-tools"
+    "$SBOMGATE" check-tools >&2 || abort "native tools do not match tools.lock (RQ11)"
+    STAGE="scan"
+    [ -z "$IMAGE_TAR" ] || SCAN_ARGS+=(--image-tar "$IMAGE_TAR")
+    [ -z "$ALLOWLIST" ] || SCAN_ARGS+=(--allowlist "$ALLOWLIST")
+    "$SBOMGATE" scan --source "$WORK/src" --out "$WORK/out" "${SCAN_ARGS[@]}" >&2 || scan_rc=$?
+  fi
+  [ -f "$WORK/out/gate.json" ] && GATE_RESULT="$(jq -r '.result // ""' "$WORK/out/gate.json" 2>/dev/null || true)"
+  if [ "$scan_rc" = 2 ]; then
+    if [ "$SIGN_FAILED" = 1 ]; then
+      NOTE="gate FAIL signed on purpose (--sign-failed); verify-release refuses this evidence unless --allow-fail-result"
+      ALLOW_FAIL_ARGS=(--allow-fail-result)
+      info "WARNING: $NOTE"
+    else
+      ABORT_CODE=2; abort "gate FAIL for $TAG ($SHA): nothing signed (use --sign-failed to sign a failed gate as evidence)"
+    fi
+  elif [ "$scan_rc" != 0 ]; then
+    abort "scan failed (exit $scan_rc)"
+  fi
+  TOOLKIT_VERSION="$(jq -r '.toolkit.version // ""' "$WORK/out/gate.json")"
+
+  # ── step 3: pre-sign checks ────────────────────────────────────────────────
+  STAGE="pre-sign"
+  [ "$(jq -r '.source.git_sha // ""' "$WORK/out/gate.json")" = "$SHA" ] || abort "gate.json source.git_sha does not equal the resolved commit $SHA"
+  verify_release "$WORK/out" --expect-sha "$SHA" --skip-signature ${ALLOW_FAIL_ARGS[@]+"${ALLOW_FAIL_ARGS[@]}"} \
+    || abort "pre-sign check of the scan output failed (see verify-release lines above)"
+  "$SBOMGATE" key-status --pub "$WORK/signer.pub" ${TK_ARGS[@]+"${TK_ARGS[@]}"} >/dev/null 2>&1 || abort "signing key $KEY_ID stopped being usable"
+  GATE_SHA="$(sha256_of "$WORK/out/gate.json")"
+
+  # ── step 4 + 5: sign, verify ───────────────────────────────────────────────
+  cosign_sign
+  STAGE="verify"
+  verify_release "$WORK/out" --expect-sha "$SHA" ${ALLOW_FAIL_ARGS[@]+"${ALLOW_FAIL_ARGS[@]}"} || abort "post-sign verify-release failed"
+  jq -e --arg k "$KEY_ID" '.key_ids_verified | index($k) != null' "$WORK/vr.json" >/dev/null || abort "post-sign verify-release did not verify the new bundle $BUNDLE"
+  populate_out
+
+  # ── step 6: publish (D5) ───────────────────────────────────────────────────
+  if [ "$NO_PUBLISH" = 0 ]; then
+    STAGE="publish"
+    evidence_checkout "$WORK/pub"
+    [ ! -e "$WORK/pub/$TAG/gate.json" ] || abort "evidence for $TAG already published on $BRANCH; use --resign or a different --tag"
+    mkdir -p "$WORK/pub/$TAG"
+    cp -R "$WORK/out/." "$WORK/pub/$TAG/"
+    git -C "$WORK/pub" add -A -- "$TAG"
+    git -C "$WORK/pub" commit -q -m "sbom-evidence: $NAME $TAG ${SHA:0:12} key=$KEY_ID" || abort "git commit on $BRANCH failed (git user.name/user.email set?)"
+    git -C "$WORK/pub" push -q "$PUSH" "HEAD:refs/heads/$BRANCH" 2>"$WORK/push.err" || abort "git push of $BRANCH to $(strip_userinfo "$PUSH") failed: $(tail -1 "$WORK/push.err")"
+    EVID_COMMIT="$(git -C "$WORK/pub" rev-parse HEAD)"
+    info "published $TAG/ to $BRANCH @ $EVID_COMMIT"
+  fi
+else
+  # ── --resign <tag> (RQ8, D9) ───────────────────────────────────────────────
+  STAGE="fetch-evidence"
+  REMOTE_URL="$(strip_userinfo "$PUSH")"
+  git check-ref-format "refs/tags/$TAG" || abort "tag '$TAG' is not a valid ref name"
+  [ -n "$OUTDIR" ] || OUTDIR="$PWD/sbom-evidence/$TAG"
+  [ ! -e "$OUTDIR" ] || abort "--out $OUTDIR already exists; refusing to overwrite evidence"
+  evidence_checkout "$WORK/old"
+  [ "$EVID_EXISTS" = 1 ] || abort "no $BRANCH branch on $REMOTE_URL"
+  [ -f "$WORK/old/$TAG/gate.json" ] || abort "no evidence for $TAG on $BRANCH"
+  mkdir -p "$WORK/out"; cp -R "$WORK/old/$TAG/." "$WORK/out/"
+  SHA="$(jq -r '.source.git_sha // .target.git_sha // ""' "$WORK/out/gate.json")"
+  NAME="$(jq -r '.target.name // ""' "$WORK/out/gate.json")"
+  TOOLKIT_VERSION="$(jq -r '.toolkit.version // ""' "$WORK/out/gate.json")"
+  GATE_RESULT="$(jq -r '.result // ""' "$WORK/out/gate.json")"
+  [ "$GATE_RESULT" = PASS ] || ALLOW_FAIL_ARGS=(--allow-fail-result)
+  STAGE="verify-existing"
+  verify_release "$WORK/out" ${ALLOW_FAIL_ARGS[@]+"${ALLOW_FAIL_ARGS[@]}"} || abort "existing evidence for $TAG does not verify with a usable key; refusing to re-sign"
+  RESIGN_OF="$(jq -r '.key_ids_verified | join(",")' "$WORK/vr.json")"
+  ! jq -e --arg k "$KEY_ID" '.key_ids_verified | index($k) != null' "$WORK/vr.json" >/dev/null || abort "$TAG is already signed by the current key $KEY_ID"
+  GATE_SHA="$(sha256_of "$WORK/out/gate.json")"
+  cosign_sign
+  STAGE="rotation"
+  [ -f "$WORK/out/rotation.json" ] || printf '[]' > "$WORK/out/rotation.json"
+  jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg f "$RESIGN_OF" --arg to "$KEY_ID" --arg g "$GATE_SHA" \
+     '. + [{time:$t, from_key_id:$f, to_key_id:$to, gate_sha256:$g}]' "$WORK/out/rotation.json" > "$WORK/rotation.new" \
+    || abort "rotation.json on $BRANCH is not a JSON array"
+  mv "$WORK/rotation.new" "$WORK/out/rotation.json"
+  STAGE="verify"
+  verify_release "$WORK/out" ${ALLOW_FAIL_ARGS[@]+"${ALLOW_FAIL_ARGS[@]}"} || abort "verify-release after re-signing failed"
+  jq -e --arg k "$KEY_ID" '.key_ids_verified | index($k) != null' "$WORK/vr.json" >/dev/null || abort "the new bundle $BUNDLE did not verify"
+  populate_out
+  if [ "$NO_PUBLISH" = 0 ]; then
+    STAGE="publish"
+    evidence_checkout "$WORK/pub"
+    [ -f "$WORK/pub/$TAG/gate.json" ] || abort "evidence for $TAG disappeared from $BRANCH while re-signing"
+    [ "$(sha256_of "$WORK/pub/$TAG/gate.json")" = "$GATE_SHA" ] || abort "gate.json for $TAG changed on $BRANCH while re-signing"
+    cp "$WORK/out/$BUNDLE" "$WORK/out/rotation.json" "$WORK/pub/$TAG/"
+    git -C "$WORK/pub" add -A -- "$TAG"
+    git -C "$WORK/pub" commit -q -m "sbom-evidence: resign $TAG $RESIGN_OF->$KEY_ID" || abort "git commit on $BRANCH failed (git user.name/user.email set?)"
+    git -C "$WORK/pub" push -q "$PUSH" "HEAD:refs/heads/$BRANCH" 2>"$WORK/push.err" || abort "git push of $BRANCH failed: $(tail -1 "$WORK/push.err")"
+    EVID_COMMIT="$(git -C "$WORK/pub" rev-parse HEAD)"
+    info "published re-signed $TAG/ to $BRANCH @ $EVID_COMMIT"
+  fi
+fi
+
+# ── step 7: log (RQ7) ────────────────────────────────────────────────────────
+STAGE="log"
+DONE=1
+write_log ok ""
+info "done: $ACTION $TAG ($SHA) key=$KEY_ID bundle=$BUNDLE${EVID_COMMIT:+ evidence=$EVID_COMMIT} out=$OUTDIR"

@@ -1,4 +1,4 @@
-# Gate policy (v1)
+# Gate policy (v1; signing & verification rules since toolkit 1.2.0)
 
 | Item | Rule |
 |---|---|
@@ -11,3 +11,8 @@
 | Record | Every run writes `gate.json` with the exemptions applied and `grype_ignored_matches`. |
 | Unknown severity | Reported, never counted. |
 | Fixability | `--only-fixed` is opt-in: by default unfixed findings at or above the threshold still fail (exempt them with an expiry, or fix the base image). |
+| Record binding | `gate.json` schema 2 (additive) carries `source {remote_url, git_sha, git_ref}` and `artifacts[] {path, sha256, size}` for every file under `sbom/` and `scan/` plus the `gate/` inputs (tools, exemptions, findings, grype-ignore). `summary.md` and `sbomgate.log` are informational and not bound. |
+| Signing | Only `gate.json` is signed (D8); SBOMs and scan results are bound indirectly through `artifacts[]`, the commit through `source.git_sha`. Signing happens only on the mac mini with `sbomsign` (D2), never in a CI runner, with a key from `policy/trusted-keys.yaml`; no Rekor/Fulcio/CT (D3). A gate FAIL is not signed unless `--sign-failed`. Container images additionally get a `cosign attest` of their SBOM. The toolkit image itself is double-signed: keyless in `release.yml` + key on the mac mini (D6). |
+| Trust | `policy/trusted-keys.yaml`, shipped inside the toolkit image and native installs, is the only trust anchor. Every key has `valid_until` (interim keys 90 days, one recorded extension allowed); a key is usable at date T iff `status: active` and `valid_from <= T <= valid_until`. Revocation = `status: revoked` + a new toolkit release; offline verifiers see it only after they update the toolkit (accepted risk R3). New keys (and the backup key) are registered and released BEFORE they sign; an old key is revoked only after every still-valid release was re-signed (RQ15, D9). |
+| Verification | `sbomgate verify-release` (offline) passes only if: gate.json schema >= 2; every `artifacts[]` file exists with matching sha256 and size; `source.git_sha` equals the commit being shipped (`--expect-sha`); at least one bundle verifies with a usable trusted key — with several bundles (after a rotation) ANY valid one is enough; `result == PASS` (unless `--allow-fail-result`). Anything else, or any error, is exit 1. `sbomgate verify-toolkit` requires an `image@sha256:` reference and a valid key signature; CI templates and SSSF run it before every scan and treat a failure as an environment error (exit 1), never as something a builder fixes. |
+| Native tool integrity | `sbomgate check-tools` compares the sha256 of the resolved syft, grype, trivy, yq, jq, cosign executables with the `*_BIN_SHA256_*` table in `tools.lock`; SSSF native mode refuses to start on any mismatch (RQ11). |

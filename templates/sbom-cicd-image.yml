@@ -1,25 +1,39 @@
 # .github/workflows/sbom-cicd.yml — variant for repos whose artifact is a container image.
+# Only adapts GitHub to the toolkit container: every judgment happens inside the image.
+# Toolkit pinned by DIGEST; get it with:
+#   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.2.0
 name: sbom-cicd
 on:
   push: { branches: [ main ] }
   workflow_dispatch:
 permissions: { contents: read }
 env:
-  TOOLKIT: ghcr.io/ivanlin/sbom-cicd-toolkit:1.1.0
+  TOOLKIT: ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>
 jobs:
   build-scan-gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Pull the toolkit by digest and verify its signature
+        run: |
+          case "$TOOLKIT" in *'<'*) echo "::error::TOOLKIT still holds the placeholder - paste the release digest"; exit 1;; *@sha256:*) ;; *) echo "::error::TOOLKIT must be image@sha256:<digest>"; exit 1;; esac
+          docker pull "$TOOLKIT"
+          docker run --rm "$TOOLKIT" verify-toolkit --image "$TOOLKIT" || {
+            echo "::error::toolkit image signature NOT verified against the trusted keys - refusing to scan"; exit 1; }
       - name: Build the image under test
         run: docker build -t app:ci .            # <- your build command
       - name: Save it as a tar for the scanner
-        run: docker save app:ci -o /tmp/app.tar
+        run: docker save app:ci -o "$RUNNER_TEMP/app.tar"
       - name: SBOM + CVE gate
         run: |
-          mkdir -p out
-          docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" -v /tmp/app.tar:/in/app.tar:ro \
-            "$TOOLKIT" scan --source /src --image-tar /in/app.tar --name my-app --out /out --fail-on HIGH
+          mkdir -p "$RUNNER_TEMP/out"
+          docker run --rm -e SBOMGATE_IMAGE_DIGEST="$TOOLKIT" \
+            -v "$PWD:/src:ro" -v "$RUNNER_TEMP/out:/out" -v "$RUNNER_TEMP/app.tar:/in/app.tar:ro" \
+            "$TOOLKIT" scan --source /src --image-tar /in/app.tar --name my-app --out /out --fail-on HIGH \
+            --source-url "https://github.com/${{ github.repository }}" --source-ref "${{ github.sha }}"
+      - name: Summary
+        if: always()
+        run: cat "$RUNNER_TEMP/out/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: sbom-cve-gate, path: out }
+        with: { name: sbom-cve-gate, path: "${{ runner.temp }}/out" }

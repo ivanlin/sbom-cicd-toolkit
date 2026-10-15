@@ -20,19 +20,28 @@ RUN set -eu; . /tmp/tools.lock; \
     fetch "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-${trivy_arch}.tar.gz" trivy.tgz "$(sha TRIVY)"; \
     fetch "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${arch}" yq "$(sha YQ)"; \
     fetch "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-${arch}" jq "$(sha JQ)"; \
+    cosign_asset="cosign-linux-${arch}"; [ -n "${COSIGN_LINUX_VARIANT:-}" ] && cosign_asset="cosign-linux-${COSIGN_LINUX_VARIANT}-${arch}"; \
+    fetch "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/${cosign_asset}" cosign "$(sha COSIGN)"; \
     mkdir -p /out/bin; \
     tar -xzf syft.tgz -C /out/bin syft; tar -xzf grype.tgz -C /out/bin grype; tar -xzf trivy.tgz -C /out/bin trivy; \
-    install -m 0755 yq /out/bin/yq; install -m 0755 jq /out/bin/jq; chmod 0755 /out/bin/*
+    install -m 0755 yq /out/bin/yq; install -m 0755 jq /out/bin/jq; install -m 0755 cosign /out/bin/cosign; chmod 0755 /out/bin/*; \
+    binsha() { eval "printf '%s' \"\$${1}_BIN_SHA256_linux_${arch}\""; }; \
+    for t in syft grype trivy yq jq cosign; do T="$(echo "$t" | tr a-z A-Z)"; echo "$(binsha "$T")  /out/bin/$t" | sha256sum -c -; done
 
 FROM ${BASE_IMAGE}
 ARG TOOLKIT_VERSION=0.0.0-dev
 ARG VCS_REF=unknown
 USER root
-RUN apk add --no-cache bash git ca-certificates-bundle coreutils findutils
+# pcsc-lite: libpcsclite.so.1 for the PIV/PKCS#11 cosign build (tools.lock COSIGN_LINUX_VARIANT)
+RUN apk add --no-cache bash git ca-certificates-bundle coreutils findutils pcsc-lite
 COPY --from=fetch /out/bin/ /usr/local/bin/
 COPY bin/sbomgate /usr/local/bin/sbomgate
+# sbomsign is meant to run on the operator host (D2); shipped so a native bundle extracted from the image is complete
+COPY bin/sbomsign /usr/local/bin/sbomsign
 COPY tools.lock VERSION /opt/sbom-cicd-toolkit/
-RUN chmod 0755 /usr/local/bin/sbomgate && mkdir -p /cache /out /src && chmod 0777 /cache /out
+COPY policy/trusted-keys.yaml /opt/sbom-cicd-toolkit/trusted-keys.yaml
+RUN chmod 0755 /usr/local/bin/sbomgate /usr/local/bin/sbomsign && mkdir -p /cache /out /src && chmod 0777 /cache /out \
+    && cosign version >/dev/null
 ENV SBOMGATE_HOME=/opt/sbom-cicd-toolkit \
     GRYPE_DB_CACHE_DIR=/cache/grype \
     TRIVY_CACHE_DIR=/cache/trivy \

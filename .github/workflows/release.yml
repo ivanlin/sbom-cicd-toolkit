@@ -1,5 +1,8 @@
 # Release: multi-arch image -> GHCR, self-scan with the just-built image, keyless cosign sign +
 # SBOM attestation, GitHub Release with the evidence attached. Triggered by tags vX.Y.Z.
+# Key signing of the image (D2/D6: second signature with the mac mini key) is NOT done here — no
+# private key ever reaches a CI runner. The run leaves out/release/KEY-SIGNING-TODO.md for the
+# operator, who runs scripts/sign-toolkit-image.sh <version> on the mac mini (docs/SIGNING.md).
 name: release
 on:
   push: { tags: [ "v*" ] }
@@ -61,11 +64,31 @@ jobs:
           # the HIGHs in this image are Go stdlib / x/net CVEs compiled into the pinned upstream scanner binaries. Projects use HIGH.
           docker run --rm -e SBOMGATE_IMAGE_DIGEST="${{ steps.build.outputs.digest }}" \
             -v "$PWD:/src:ro" -v "$PWD/out/self-scan:/out" -v "$RUNNER_TEMP/self.tar:/in/self.tar:ro" "$ref" \
-            scan --source /src --exclude './examples/**' --image-tar /in/self.tar --name sbom-cicd-toolkit --label "${{ steps.ver.outputs.version }}" --out /out --fail-on CRITICAL
+            scan --source /src --exclude './examples/**' --image-tar /in/self.tar --name sbom-cicd-toolkit --label "${{ steps.ver.outputs.version }}" --out /out --fail-on CRITICAL \
+                 --source-url "https://github.com/${{ github.repository }}" --source-ref "${{ github.ref_name }}"
           code=$?; set -e
           cat out/self-scan/summary.md >> "$GITHUB_STEP_SUMMARY"
           echo "exit=$code" >> "$GITHUB_OUTPUT"
           exit $code
+      - name: Pinned tools check (check-tools vs tools.lock) + tool versions, both architectures
+        run: |
+          set -o pipefail
+          ref="$IMAGE@${{ steps.build.outputs.digest }}"
+          for p in amd64 arm64; do
+            docker run --rm --platform "linux/$p" "$ref" check-tools 2>&1 | tee "out/release/check-tools.linux-$p.txt"
+            docker run --rm --platform "linux/$p" "$ref" tools | tee "out/release/tools.linux-$p.json"
+          done
+          cp out/release/check-tools.linux-amd64.txt out/release/check-tools.txt
+          cp out/release/tools.linux-amd64.json out/release/tools.json
+      - name: Trusted keys baked into the image (verify-toolkit / verify-release trust these)
+        run: |
+          ref="$IMAGE@${{ steps.build.outputs.digest }}"
+          docker run --rm --platform linux/amd64 --entrypoint cat "$ref" /opt/sbom-cicd-toolkit/trusted-keys.yaml > out/release/trusted-keys.image.yaml
+          cmp out/release/trusted-keys.image.yaml policy/trusted-keys.yaml || { echo "::error::image trusted-keys.yaml differs from policy/trusted-keys.yaml"; exit 1; }
+          cp policy/trusted-keys.yaml out/release/trusted-keys.yaml
+          n="$(docker run --rm --platform linux/amd64 --entrypoint yq "$ref" '[.keys[] | select(.status == "active")] | length' /opt/sbom-cicd-toolkit/trusted-keys.yaml)"
+          echo "active trusted keys in this release: $n" | tee out/release/trusted-keys.count.txt
+          [ "$n" -gt 0 ] || echo "::warning::policy/trusted-keys.yaml has no active key: verify-toolkit / verify-release in this image will reject every signature"
       - uses: sigstore/cosign-installer@v3
       - name: Keyless sign the index digest + attest the image SBOM (Sigstore / Rekor)
         run: |
@@ -74,10 +97,38 @@ jobs:
           cosign attest --yes --type cyclonedx --predicate out/self-scan/sbom/sbom-cicd-toolkit.image.cdx.json "$ref" 2>&1 | tee out/release/cosign-attest.log
           cosign verify "$ref" --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com -o text 2>&1 | tee out/release/cosign-verify.log
+      - name: Operator TODO — key signature of the image happens on the mac mini, never here (D2)
+        run: |
+          v="${{ steps.ver.outputs.version }}"; d="${{ steps.build.outputs.digest }}"
+          cat > out/release/KEY-SIGNING-TODO.md <<TODO
+          # Key-sign sbom-cicd-toolkit $v (operator, mac mini)
+
+          The keyless (Sigstore) signature and SBOM attestation were made by this workflow.
+          The **key** signature (D6, the path consumers verify by default) is NOT made in CI (D2).
+          Until it exists, \`verify-toolkit\` rejects this image and consumers must not pin it.
+
+          Image (pin this exact ref): \`$IMAGE@$d\`
+
+          On the mac mini, in a checkout of tag v$v:
+
+          \`\`\`bash
+          git fetch --tags && git checkout v$v
+          scripts/sign-toolkit-image.sh $v            # key from \$SBOMSIGN_KEY, or --key <URI>
+          docker run --rm $IMAGE@$d verify-toolkit --image $IMAGE@$d   # must print PASS
+          \`\`\`
+
+          Then publish the digest to consumers (templates / sssf.config.yaml / bitbucket-pipelines.yml).
+          See docs/SIGNING.md and docs/RELEASING.md.
+          TODO
+          cat out/release/KEY-SIGNING-TODO.md >> "$GITHUB_STEP_SUMMARY"
       - name: Native bundle (same tools.lock, for machines without Docker)
         run: |
-          tar -czf "out/release/sbom-cicd-toolkit-${{ steps.ver.outputs.version }}-native.tar.gz" VERSION tools.lock bin install templates policy
-          (cd out/release && sha256sum *.tar.gz > SHA256SUMS)
+          # bin/ carries sbomgate + sbomsign, policy/ carries trusted-keys.yaml; cosign itself is
+          # fetched by install/ from the sha256 pinned in tools.lock (like syft/grype/trivy/yq/jq).
+          for f in bin/sbomgate bin/sbomsign policy/trusted-keys.yaml; do test -f "$f" || { echo "::error::missing $f"; exit 1; }; done
+          grep -q '^COSIGN_VERSION=' tools.lock || { echo "::error::tools.lock has no COSIGN_VERSION"; exit 1; }
+          tar -czf "out/release/sbom-cicd-toolkit-${{ steps.ver.outputs.version }}-native.tar.gz" VERSION tools.lock bin install templates policy scripts docs
+          (cd out/release && sha256sum -- *.tar.gz > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: release-evidence, path: out }
@@ -89,5 +140,5 @@ jobs:
           cp out/self-scan/summary.md out/release/self-scan.summary.md
           cp out/self-scan/sbom/*.json out/release/
           gh release create "$GITHUB_REF_NAME" --title "sbom-cicd-toolkit $GITHUB_REF_NAME" \
-            --notes "Image: \`$IMAGE:${{ steps.ver.outputs.version }}\` · index digest \`${{ steps.build.outputs.digest }}\` · per-arch digests in manifest.txt · self-scan gate: $(jq -r .result out/self-scan/gate.json)" \
+            --notes "Image: \`$IMAGE:${{ steps.ver.outputs.version }}\` · pin: \`$IMAGE@${{ steps.build.outputs.digest }}\` · per-arch digests in manifest.txt · self-scan gate: $(jq -r .result out/self-scan/gate.json) · key signature: pending operator (KEY-SIGNING-TODO.md) — do not pin before verify-toolkit passes" \
             out/release/*

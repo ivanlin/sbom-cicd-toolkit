@@ -1,0 +1,73 @@
+# bitbucket-pipelines.yml — variant for repos whose artifact is a container image: the source tree
+# AND the built image (docker save tar) are gated together.
+# Copy to the repo root as `bitbucket-pipelines.yml`, change NAME and the build command.
+#
+# This file only ADAPTS Bitbucket to the toolkit container (RQ12/RQ13): every judgment happens
+# inside the image; the container reads no Bitbucket variables (commit/remote are CLI arguments).
+#
+# Toolkit image: pinned by DIGEST. Get it with
+#   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.2.0
+# Measured limits: 1x step = 4096 MB total, docker service default 1024 MB (max 3072 MB) -> size: 2x
+# + docker memory 3072. Bind mounts must stay under $BITBUCKET_CLONE_DIR, so the image tar and the
+# output directory live in the clone and are hidden from the source scan via .git/info/exclude.
+image: atlassian/default-image:4
+
+definitions:
+  services:
+    docker:
+      memory: 3072
+  steps:
+    - step: &build-scan-gate
+        name: build image + SBOM + CVE gate (sbom-cicd-toolkit)
+        size: 2x
+        services: [ docker ]
+        script:
+          - export TOOLKIT="ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>"
+          - export NAME="my-app"            # SBOM / artifact name
+          - export FAIL_ON="HIGH"           # project floor is HIGH (policy/gate-policy.md)
+          - case "$TOOLKIT" in *'<'*) echo "TOOLKIT still holds the placeholder - paste the release digest" >&2; exit 1;; *@sha256:*) ;; *) echo "TOOLKIT must be pinned as image@sha256:<digest>" >&2; exit 1;; esac
+          - docker pull "$TOOLKIT"
+          - >-
+            docker run --rm "$TOOLKIT" verify-toolkit --image "$TOOLKIT"
+            || { echo "toolkit image signature NOT verified against the trusted keys - refusing to scan (exit 1, do not 'fix' the code)" >&2; exit 1; }
+          - docker build -t app:ci .        # <- your build command
+          - mkdir -p sbom-out sbom-in && chmod 0777 sbom-out
+          - printf 'sbom-out/\nsbom-in/\n' >> .git/info/exclude
+          - docker save app:ci -o sbom-in/app.tar && chmod 0644 sbom-in/app.tar
+          - >-
+            docker run --rm -e SBOMGATE_IMAGE_DIGEST="$TOOLKIT"
+            -v "$BITBUCKET_CLONE_DIR:/src:ro" -v "$BITBUCKET_CLONE_DIR/sbom-out:/out"
+            -v "$BITBUCKET_CLONE_DIR/sbom-in/app.tar:/in/app.tar:ro"
+            "$TOOLKIT" scan --source /src --image-tar /in/app.tar --name "$NAME" --out /out --fail-on "$FAIL_ON"
+            --source-url "$BITBUCKET_GIT_HTTP_ORIGIN" --source-ref "$BITBUCKET_COMMIT"
+        after-script:
+          # exit 0 = PASS · 2 = gate FAIL · 1 = tool/policy/verification error
+          - cat sbom-out/summary.md 2>/dev/null || echo "no summary.md (scan did not run to the end)"
+        artifacts:
+          - sbom-out/**
+
+pipelines:
+  default:
+    - step: *build-scan-gate
+  pull-requests:
+    '**':
+      - step: *build-scan-gate
+  custom:
+    # RQ14 consistency test (manual trigger): the toolkit's own fixtures on Bitbucket.
+    fixtures:
+      - step:
+          name: toolkit fixtures (vuln-app -> 2, clean-app -> 0)
+          size: 2x
+          services: [ docker ]
+          script:
+            - export TOOLKIT="ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>"
+            - export TOOLKIT_TAG="v1.2.0"   # the git tag that produced the digest above
+            - docker pull "$TOOLKIT"
+            - >-
+              docker run --rm "$TOOLKIT" verify-toolkit --image "$TOOLKIT"
+              || { echo "toolkit image signature NOT verified - refusing to run fixtures" >&2; exit 1; }
+            - git clone --quiet --depth 1 --branch "$TOOLKIT_TAG" https://github.com/ivanlin/sbom-cicd-toolkit.git sbom-cicd-toolkit-src
+            - mkdir -p sbom-fixtures/vuln sbom-fixtures/clean && chmod -R 0777 sbom-fixtures
+            - bash sbom-cicd-toolkit-src/scripts/fixtures-container.sh "$TOOLKIT" "bitbucket-pipelines/linux-amd64/container" sbom-fixtures
+          artifacts:
+            - sbom-fixtures/**
