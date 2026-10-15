@@ -4,7 +4,7 @@
 # bash 3.2 compatible on purpose (macOS ships 3.2): no associative arrays, no ${x,,}.
 #
 #   sbomgate scan --source DIR [--image-tar FILE | --image REF] [--out DIR] [--name NAME]
-#                 [--label VERSION] [--fail-on CRITICAL|HIGH|MEDIUM|LOW|none]
+#                 [--label VERSION] [--fail-on CRITICAL|HIGH|MEDIUM|LOW|none]  (default HIGH)
 #                 [--allowlist FILE] [--only-fixed] [--no-trivy]
 #   sbomgate tools        # versions of every bundled tool, as JSON
 #   sbomgate version      # toolkit version
@@ -99,7 +99,7 @@ render_allowlist() {  # $1 allowlist.yaml  $2 grype-config-out  $3 exemptions-js
 
 # ── scan ─────────────────────────────────────────────────────────────────────
 cmd_scan() {
-  local SRC="" IMAGE_TAR="" IMAGE_REF="" OUT="" NAME="" LABEL="" FAIL_ON="${SBOMGATE_FAIL_ON:-CRITICAL}" ALLOW="" ONLY_FIXED=0 NO_TRIVY=0 GIT_FILTER=1 EXCL_ARGS=()
+  local SRC="" IMAGE_TAR="" IMAGE_REF="" OUT="" NAME="" LABEL="" FAIL_ON="${SBOMGATE_FAIL_ON:-HIGH}" ALLOW="" ONLY_FIXED=0 NO_TRIVY=0 GIT_FILTER=1 EXCL_ARGS=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --source) SRC="$2"; shift 2;;      --image-tar) IMAGE_TAR="$2"; shift 2;;

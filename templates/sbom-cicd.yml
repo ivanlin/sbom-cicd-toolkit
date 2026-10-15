@@ -7,8 +7,8 @@ on:
 permissions: { contents: read }
 jobs:
   sbom-cve-gate:
-    uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.0.2
+    uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.1.0
     with:
       name: my-project           # artifact / SBOM name
       source: .                  # directory to scan (repo-relative)
-      fail_on: CRITICAL          # CRITICAL | HIGH | MEDIUM | LOW | none
+      fail_on: HIGH          # CRITICAL | HIGH | MEDIUM | LOW | none

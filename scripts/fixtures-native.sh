@@ -5,8 +5,8 @@ set -uo pipefail
 LABEL="$1"; OUT="$2"; HERE="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$OUT"; start=$(date +%s)
 sbomgate tools > "$OUT/tools.json"
-sbomgate scan --source "$HERE/examples/vuln-app"  --name vuln-app  --out "$OUT/vuln"  --fail-on CRITICAL; v=$?
-sbomgate scan --source "$HERE/examples/clean-app" --name clean-app --out "$OUT/clean" --fail-on CRITICAL; c=$?
+sbomgate scan --source "$HERE/examples/vuln-app"  --name vuln-app  --out "$OUT/vuln"  --fail-on HIGH; v=$?
+sbomgate scan --source "$HERE/examples/clean-app" --name clean-app --out "$OUT/clean" --fail-on HIGH; c=$?
 end=$(date +%s)
 ok=true; [ "$v" = 2 ] || ok=false; [ "$c" = 0 ] || ok=false
 jq -n --arg l "$LABEL" --argjson v "$v" --argjson c "$c" --argjson d "$((end-start))" --argjson ok "$ok" --slurpfile t "$OUT/tools.json" \

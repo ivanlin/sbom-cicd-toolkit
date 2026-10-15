@@ -1,11 +1,11 @@
 # Reusable SBOM + CVE gate. Call it from any repo:
 #   jobs:
 #     gate:
-#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.0.2
+#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.1.0
 #       with:
 #         name: my-project
 #         source: .
-#         fail_on: CRITICAL
+#         fail_on: HIGH
 name: sbom-cve-gate (reusable)
 on:
   workflow_call:
@@ -20,14 +20,14 @@ on:
         description: "directory to scan, repo-relative"
       fail_on:
         type: string
-        default: "CRITICAL"
-        description: "CRITICAL | HIGH | MEDIUM | LOW | none"
+        default: "HIGH"
+        description: "CRITICAL | HIGH | MEDIUM | LOW | none — default HIGH; the project policy floor is HIGH (CRITICAL findings must be fixed, not exempted)"
       only_fixed:
         type: boolean
         default: false
       toolkit_image:
         type: string
-        default: "ghcr.io/ivanlin/sbom-cicd-toolkit:1.0.2"
+        default: "ghcr.io/ivanlin/sbom-cicd-toolkit:1.1.0"
     outputs:
       result:
         value: ${{ jobs.gate.outputs.result }}

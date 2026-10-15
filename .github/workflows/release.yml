@@ -57,6 +57,8 @@ jobs:
           docker pull --platform linux/amd64 "$ref"
           docker save "$ref" -o "$RUNNER_TEMP/self.tar"
           mkdir -p out/self-scan; set +e
+          # Self-scan threshold is CRITICAL on purpose (documented exception, see docs/RELEASING.md 1.1.0 and policy/gate-policy.md):
+          # the HIGHs in this image are Go stdlib / x/net CVEs compiled into the pinned upstream scanner binaries. Projects use HIGH.
           docker run --rm -e SBOMGATE_IMAGE_DIGEST="${{ steps.build.outputs.digest }}" \
             -v "$PWD:/src:ro" -v "$PWD/out/self-scan:/out" -v "$RUNNER_TEMP/self.tar:/in/self.tar:ro" "$ref" \
             scan --source /src --exclude './examples/**' --image-tar /in/self.tar --name sbom-cicd-toolkit --label "${{ steps.ver.outputs.version }}" --out /out --fail-on CRITICAL
