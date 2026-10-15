@@ -73,10 +73,13 @@ jobs:
       - name: Pinned tools check (check-tools vs tools.lock) + tool versions, both architectures
         run: |
           set -o pipefail
-          ref="$IMAGE@${{ steps.build.outputs.digest }}"
+          # Run each architecture by its OWN manifest digest (per-arch-digests.txt): pulling the index digest
+          # twice with different --platform values fails with "cannot overwrite digest" (1.2.0 release run).
           for p in amd64 arm64; do
-            docker run --rm --platform "linux/$p" "$ref" check-tools 2>&1 | tee "out/release/check-tools.linux-$p.txt"
-            docker run --rm --platform "linux/$p" "$ref" tools | tee "out/release/tools.linux-$p.json"
+            d="$(awk -v a="linux/$p" '$1==a{print $2}' out/release/per-arch-digests.txt)"
+            [ -n "$d" ] || { echo "::error::no linux/$p manifest in per-arch-digests.txt"; exit 1; }
+            docker run --rm --platform "linux/$p" "$IMAGE@$d" check-tools 2>&1 | tee "out/release/check-tools.linux-$p.txt"
+            docker run --rm --platform "linux/$p" "$IMAGE@$d" tools | tee "out/release/tools.linux-$p.json"
           done
           cp out/release/check-tools.linux-amd64.txt out/release/check-tools.txt
           cp out/release/tools.linux-amd64.json out/release/tools.json

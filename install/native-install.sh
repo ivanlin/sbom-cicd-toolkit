@@ -24,7 +24,9 @@ case "$(uname -m)" in
 esac
 [ "$OS/$ARCH" = "windows/arm64" ] && { echo "windows/arm64 has no pinned binaries in tools.lock" >&2; exit 1; }
 
-sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+# GNU sha256sum prefixes the line with '\' when the file name contains a backslash (Git Bash paths such as
+# D:\a\_temp/...); strip it so the hash compares equal.
+sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1 | sed 's/^\\//'; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 verify() { local got; got="$(sha256_of "$1")"; [ "$got" = "$2" ] || { echo "sha256 mismatch for $1: got $got want $2" >&2; exit 1; }; }
 lock() { eval "printf '%s' \"\$${1}_SHA256_${OS}_${ARCH}\""; }
 binlock() { eval "printf '%s' \"\${${1}_BIN_SHA256_${OS}_${ARCH}:-}\""; }

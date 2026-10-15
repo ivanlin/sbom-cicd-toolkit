@@ -6,7 +6,7 @@
 # Bitbucket variables — the commit and remote URL are handed over as plain CLI arguments.
 #
 # Toolkit image: pinned by DIGEST, never by tag. Get the digest of a release with
-#   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.2.0
+#   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.2.1
 # (the "Digest:" line of the index) and paste it below. Bump deliberately (docs/RELEASING.md).
 #
 # Measured Bitbucket limits (2026-10): a 1x step has 4096 MB in total and the docker service gets
@@ -64,7 +64,7 @@ pipelines:
           services: [ docker ]
           script:
             - export TOOLKIT="ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>"
-            - export TOOLKIT_TAG="v1.2.0"   # the git tag that produced the digest above
+            - export TOOLKIT_TAG="v1.2.1"   # the git tag that produced the digest above
             - docker pull "$TOOLKIT"
             - >-
               docker run --rm "$TOOLKIT" verify-toolkit --image "$TOOLKIT"

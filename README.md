@@ -14,7 +14,7 @@ One versioned tool, one command, same result everywhere: **SBOM (CycloneDX 1.7 +
 - CI templates for GitHub Actions **and Bitbucket Pipelines** — they only adapt; all judgment is inside the container
 
 ```
-TK=ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>   # docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.2.0
+TK=ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>   # docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.2.1
 docker run --rm "$TK" verify-toolkit --image "$TK"                 # signature of the pinned image (exit 0 = trusted)
 docker run --rm -v sbomgate-cache:/cache -v "$PWD:/src:ro" -v "$PWD/sbom-out:/out" \
   "$TK" scan --source /src --name my-app --out /out --fail-on HIGH
