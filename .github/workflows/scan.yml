@@ -1,7 +1,7 @@
 # Reusable SBOM + CVE gate. Call it from any repo:
 #   jobs:
 #     gate:
-#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.3.0
+#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.3.1
 #       with:
 #         name: my-project
 #         source: .
@@ -44,7 +44,7 @@ on:
         default: false
       toolkit_image:
         type: string
-        # get it with: docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.3.0
+        # get it with: docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.3.1
         default: "ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>"
         description: "toolkit image pinned by digest (image@sha256:...); a tag-only ref is refused"
     outputs:

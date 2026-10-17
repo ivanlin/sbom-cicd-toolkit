@@ -1,7 +1,7 @@
 # .github/workflows/sbom-cicd.yml — drop-in for any repo. Source scan via the reusable workflow.
 # The workflow pulls the toolkit by digest, verifies its signature (verify-toolkit), then scans.
 # Get the digest of a release with:
-#   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.3.0
+#   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.3.1
 #
 # Enforcement: CI always ENFORCES — every non-zero exit fails the job. Since 1.3.0 the code says
 # why (`sbomgate exit-codes`): 2 CVEs at or above fail_on · 3 an external resource (registry,
@@ -20,7 +20,7 @@ on:
 permissions: { contents: read }
 jobs:
   sbom-cve-gate:
-    uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.3.0
+    uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.3.1
     with:
       name: my-project           # artifact / SBOM name
       source: .                  # directory to scan (repo-relative)

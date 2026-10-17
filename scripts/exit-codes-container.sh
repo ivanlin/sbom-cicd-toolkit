@@ -31,6 +31,9 @@ docker run --rm -v "$HERE/examples:/src:ro" -v "$OUT/vr:/out" "$IMG" scan --sour
 case_ verify-release-ok     0 docker run --rm --network none -v "$OUT/vr:/b" "$IMG" verify-release --bundle-dir /b --skip-signature
 cp -R "$OUT/vr" "$OUT/vr-tampered"; printf 'x' >> "$OUT/vr-tampered/sbom/clean-app.source.cdx.json"
 case_ untrusted-tampered    4 docker run --rm --network none -v "$OUT/vr-tampered:/b" "$IMG" verify-release --bundle-dir /b --skip-signature
+# 1.3.1 regression: cwd = the source tree, --out inside it
+mkdir -p "$OUT/inside"; cp -R "$HERE/examples/clean-app/." "$OUT/inside/"
+case_ out-inside-source      0 docker run --rm -w /src -v "$OUT/inside:/src" "$IMG" scan --source . --name inside --out ./sbom-out
 docker run --rm "$IMG" exit-codes --json > "$OUT/exit-codes.json"
 jq -s --arg i "$IMG" --argjson ok "$([ "$fail" = 0 ] && echo true || echo false)" '{image:$i, cases:., ok:$ok}' "$OUT/cases.jsonl" > "$OUT/result.json"
 [ "$fail" = 0 ]

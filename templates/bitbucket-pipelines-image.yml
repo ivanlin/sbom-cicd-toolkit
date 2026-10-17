@@ -6,7 +6,7 @@
 # inside the image; the container reads no Bitbucket variables (commit/remote are CLI arguments).
 #
 # Toolkit image: pinned by DIGEST. Get it with
-#   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.3.0
+#   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.3.1
 # Measured limits: 1x step = 4096 MB total, docker service default 1024 MB (max 3072 MB) -> size: 2x
 # + docker memory 3072. Bind mounts must stay under $BITBUCKET_CLONE_DIR, so the image tar and the
 # output directory live in the clone and are hidden from the source scan via .git/info/exclude.
@@ -71,7 +71,7 @@ pipelines:
           services: [ docker ]
           script:
             - export TOOLKIT="ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>"
-            - export TOOLKIT_TAG="v1.3.0"   # the git tag that produced the digest above
+            - export TOOLKIT_TAG="v1.3.1"   # the git tag that produced the digest above
             - docker pull "$TOOLKIT"
             - >-
               docker run --rm "$TOOLKIT" verify-toolkit --image "$TOOLKIT"

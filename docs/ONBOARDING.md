@@ -4,7 +4,7 @@
 
 工具箱映像一律**以 digest 釘版**（1.2.0 起），不要只寫 tag。取得某版的 digest：
 ```bash
-docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.3.0   # 取 "Digest:" 那行（index digest）
+docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.3.1   # 取 "Digest:" 那行（index digest）
 TK="ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>"         # 下文都用 $TK
 ```
 只在該版的 key 簽章完成後才換 digest：`docker run --rm "$TK" verify-toolkit --image "$TK"` 要 exit 0（見 docs/RELEASING.md、docs/SIGNING.md）。
@@ -28,7 +28,7 @@ CI 會另外傳 `--source-url <repo URL> --source-ref <commit>`，寫進 gate.js
 
 ## 2. 加入豁免檔（空的也要有，閘門才有地方留紀錄）
 ```bash
-mkdir -p .sbom-cicd && curl -fsSL https://raw.githubusercontent.com/ivanlin/sbom-cicd-toolkit/v1.3.0/templates/allowlist.yaml -o .sbom-cicd/allowlist.yaml
+mkdir -p .sbom-cicd && curl -fsSL https://raw.githubusercontent.com/ivanlin/sbom-cicd-toolkit/v1.3.1/templates/allowlist.yaml -o .sbom-cicd/allowlist.yaml
 echo "sbom-out/" >> .gitignore
 ```
 每筆豁免必填 `vulnerability / reason / approved_by / approved_on / expires`；過期即 exit 5（政策錯誤；1.3.0 前為 exit 1），不會靜默放行。豁免進 git，PR review 就是核准紀錄。
@@ -37,7 +37,7 @@ echo "sbom-out/" >> .gitignore
 原始碼型專案（複製範本後改 `name:` 並把 `toolkit_image:` 換成 release 的 digest）：
 ```bash
 mkdir -p .github/workflows
-curl -fsSL https://raw.githubusercontent.com/ivanlin/sbom-cicd-toolkit/v1.3.0/templates/sbom-cicd.yml -o .github/workflows/sbom-cicd.yml
+curl -fsSL https://raw.githubusercontent.com/ivanlin/sbom-cicd-toolkit/v1.3.1/templates/sbom-cicd.yml -o .github/workflows/sbom-cicd.yml
 ```
 容器映像型專案改用 `templates/sbom-cicd-image.yml`（改 `TOOLKIT:` 的 digest），把 `docker build` 那一行換成自己的建置指令。
 流程：以 digest 拉映像 → `verify-toolkit`（驗簽失敗即停：簽章不符 exit 4、registry 連不到 exit 3）→ 掃描 → 上傳產物。`toolkit_image` 仍是 `<fill-from-release>` 佔位字串或只寫 tag 時，workflow 會直接失敗並提示。
@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/ivanlin/sbom-cicd-toolkit/v1.3.0/te
 
 ## 4. Bitbucket Pipelines
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ivanlin/sbom-cicd-toolkit/v1.3.0/templates/bitbucket-pipelines.yml -o bitbucket-pipelines.yml
+curl -fsSL https://raw.githubusercontent.com/ivanlin/sbom-cicd-toolkit/v1.3.1/templates/bitbucket-pipelines.yml -o bitbucket-pipelines.yml
 # 容器映像型專案改抓 templates/bitbucket-pipelines-image.yml（同樣存成 repo 根目錄的 bitbucket-pipelines.yml）
 ```
 1. 改檔內 `TOOLKIT=` 的 digest、`NAME=`（映像型另改 `docker build` 那行）。repo 已有 `bitbucket-pipelines.yml` 時，把 `definitions` 與 step 併進去即可。

@@ -264,10 +264,12 @@ cmd_scan() {
       log "git filter: snapshot of $n tracked/untracked-not-ignored file(s) -> $SCAN_DIR"
     fi
     log "syft: source SBOM of $SRC (excludes: ${EXCL_ARGS[*]-none})"
-    local excl=""
-    case "$OUT" in "$SRC"/*) excl="--exclude ./${OUT#"$SRC"/}/**";; esac
-    # shellcheck disable=SC2086
-    syft_or_die "source tree" "$ERRD/syft.source.err" scan "dir:$(wpath "$SCAN_DIR")" -q --source-name "$NAME" --source-version "$LABEL" --exclude './.git/**' $excl ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} \
+    # --out inside the source: exclude it. An ARRAY, quoted: as an unquoted string the `**` was
+    # glob-expanded by bash whenever the cwd was the source tree (sssf native mode), handing syft
+    # several paths ("accepts at most 1 arg(s)") — broken since 1.0, fixed in 1.3.1.
+    local SELF_EXCL=()
+    case "$OUT" in "$SRC"/*) SELF_EXCL=(--exclude "./${OUT#"$SRC"/}/**");; esac
+    syft_or_die "source tree" "$ERRD/syft.source.err" scan "dir:$(wpath "$SCAN_DIR")" -q --source-name "$NAME" --source-version "$LABEL" --exclude './.git/**' ${SELF_EXCL[@]+"${SELF_EXCL[@]}"} ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} \
       -o "cyclonedx-json=$(wpath "$OUT/sbom/$NAME.source.cdx.json")" -o "spdx-json=$(wpath "$OUT/sbom/$NAME.source.spdx.json")"
     [ "$SCAN_DIR" = "$SRC" ] || rm -rf "$SCAN_DIR"
     KINDS="source"
