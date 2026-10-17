@@ -10,6 +10,15 @@
 # Measured limits: 1x step = 4096 MB total, docker service default 1024 MB (max 3072 MB) -> size: 2x
 # + docker memory 3072. Bind mounts must stay under $BITBUCKET_CLONE_DIR, so the image tar and the
 # output directory live in the clone and are hidden from the source scan via .git/info/exclude.
+#
+# Enforcement: CI always ENFORCES — exit 2 (CVEs at or above fail_on) fails the job, and so does
+# exit 1 (tool / policy / signature-verification error, including an unreachable registry or
+# vulnerability DB). The sssf factory's LOCAL supply-chain node has its own, independent switch
+# (defaults.supply_chain.enforcement: off | advisory | enforce, plus on_unavailable: block | degrade
+# under enforce). Local commits carrying a "Supply-Chain: advisory …", "… off" or "… degraded"
+# trailer were not gated on the developer machine — this job is where they get scanned for real.
+# There is deliberately no advisory or degrade option here: if the runner cannot reach the
+# registry or a vulnerability DB, re-run the job; do not weaken it.
 image: atlassian/default-image:4
 
 definitions:

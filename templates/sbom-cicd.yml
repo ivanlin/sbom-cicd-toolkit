@@ -2,6 +2,15 @@
 # The workflow pulls the toolkit by digest, verifies its signature (verify-toolkit), then scans.
 # Get the digest of a release with:
 #   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.2.1
+#
+# Enforcement: CI always ENFORCES — exit 2 (CVEs at or above fail_on) fails the job, and so does
+# exit 1 (tool / policy / signature-verification error, including an unreachable registry or
+# vulnerability DB). The sssf factory's LOCAL supply-chain node has its own, independent switch
+# (defaults.supply_chain.enforcement: off | advisory | enforce, plus on_unavailable: block | degrade
+# under enforce). Local commits carrying a "Supply-Chain: advisory …", "… off" or "… degraded"
+# trailer were not gated on the developer machine — this job is where they get scanned for real.
+# There is deliberately no advisory or degrade option here: if the runner cannot reach the
+# registry or a vulnerability DB, re-run the job; do not weaken it.
 name: sbom-cicd
 on:
   push: { branches: [ main ] }

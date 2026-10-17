@@ -13,6 +13,15 @@
 # 1024 MB by default (max 3072 MB). The scanners need more than 1 GB, hence size: 2x + 3072 MB.
 # Bitbucket only allows `docker run -v` bind mounts under $BITBUCKET_CLONE_DIR, so the output
 # directory lives inside the clone and is hidden from the scan via .git/info/exclude.
+#
+# Enforcement: CI always ENFORCES — exit 2 (CVEs at or above fail_on) fails the job, and so does
+# exit 1 (tool / policy / signature-verification error, including an unreachable registry or
+# vulnerability DB). The sssf factory's LOCAL supply-chain node has its own, independent switch
+# (defaults.supply_chain.enforcement: off | advisory | enforce, plus on_unavailable: block | degrade
+# under enforce). Local commits carrying a "Supply-Chain: advisory …", "… off" or "… degraded"
+# trailer were not gated on the developer machine — this job is where they get scanned for real.
+# There is deliberately no advisory or degrade option here: if the runner cannot reach the
+# registry or a vulnerability DB, re-run the job; do not weaken it.
 image: atlassian/default-image:4
 
 definitions:
