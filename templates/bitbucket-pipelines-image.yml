@@ -6,14 +6,15 @@
 # inside the image; the container reads no Bitbucket variables (commit/remote are CLI arguments).
 #
 # Toolkit image: pinned by DIGEST. Get it with
-#   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.2.1
+#   docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.3.0
 # Measured limits: 1x step = 4096 MB total, docker service default 1024 MB (max 3072 MB) -> size: 2x
 # + docker memory 3072. Bind mounts must stay under $BITBUCKET_CLONE_DIR, so the image tar and the
 # output directory live in the clone and are hidden from the source scan via .git/info/exclude.
 #
-# Enforcement: CI always ENFORCES — exit 2 (CVEs at or above fail_on) fails the job, and so does
-# exit 1 (tool / policy / signature-verification error, including an unreachable registry or
-# vulnerability DB). The sssf factory's LOCAL supply-chain node has its own, independent switch
+# Enforcement: CI always ENFORCES — every non-zero exit fails the job. Since 1.3.0 the code says
+# why (`sbomgate exit-codes`): 2 CVEs at or above fail_on · 3 an external resource (registry,
+# vulnerability DB) could not be got · 4 untrusted (signature / tools.lock / evidence) ·
+# 5 policy error (allowlist, trusted keys, threshold) · 64 usage · 1 anything else. The sssf factory's LOCAL supply-chain node has its own, independent switch
 # (defaults.supply_chain.enforcement: off | advisory | enforce, plus on_unavailable: block | degrade
 # under enforce). Local commits carrying a "Supply-Chain: advisory …", "… off" or "… degraded"
 # trailer were not gated on the developer machine — this job is where they get scanned for real.
@@ -50,7 +51,7 @@ definitions:
             "$TOOLKIT" scan --source /src --image-tar /in/app.tar --name "$NAME" --out /out --fail-on "$FAIL_ON"
             --source-url "$BITBUCKET_GIT_HTTP_ORIGIN" --source-ref "$BITBUCKET_COMMIT"
         after-script:
-          # exit 0 = PASS · 2 = gate FAIL · 1 = tool/policy/verification error
+          # exit 0 = PASS · 2 = gate FAIL · 3 unavailable · 4 untrusted · 5 policy · 64 usage · 1 other
           - cat sbom-out/summary.md 2>/dev/null || echo "no summary.md (scan did not run to the end)"
         artifacts:
           - sbom-out/**
@@ -70,7 +71,7 @@ pipelines:
           services: [ docker ]
           script:
             - export TOOLKIT="ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>"
-            - export TOOLKIT_TAG="v1.2.1"   # the git tag that produced the digest above
+            - export TOOLKIT_TAG="v1.3.0"   # the git tag that produced the digest above
             - docker pull "$TOOLKIT"
             - >-
               docker run --rm "$TOOLKIT" verify-toolkit --image "$TOOLKIT"

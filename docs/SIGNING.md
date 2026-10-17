@@ -1,4 +1,4 @@
-# SBOM 簽章與驗證 — 操作手冊（sbom-cicd-toolkit 1.2.1）
+# SBOM 簽章與驗證 — 操作手冊（sbom-cicd-toolkit 1.3.0）
 
 本文件給兩種人看：**簽章操作者**（在 mac mini 上產生金鑰、簽 release、輪替金鑰）與**驗證者**（拿到證據後離線驗證）。所有指令都可以照抄；私鑰、密碼、PIN 一律由操作者本人在自己的終端機輸入，任何自動化工具（含 AI agent）都不碰。
 
@@ -167,8 +167,8 @@ GitHub 與 Bitbucket 的驗證流程完全相同，只有 `REPO` 不同（AC4）
 docker run --rm "$TK" verify-toolkit --image "$TK"      # 0 = 某把可用金鑰簽過這個 digest
 ```
 
-- 只接受 `image@sha256:…`，只寫 tag 會 exit 1（要求釘 digest）。
-- 需要連到 registry 讀簽章（不需要 GitHub/Bitbucket API）。驗證失敗一律 exit 1，CI 範本與 sssf 把它歸類為環境錯誤，不交給 builder 修（RQ2）。
+- 只接受 `image@sha256:…`，只寫 tag 會 exit 64（用法錯誤，要求釘 digest；1.3.0 前為 exit 1）。
+- 需要連到 registry 讀簽章（不需要 GitHub/Bitbucket API）。1.3.0 起分兩種：簽章不符／無可用信任金鑰 exit 4（不受信任，任何模式都不降級），讀不到 registry 的簽章 exit 3（外部資源不可達，不是簽章問題）；兩者都不交給 builder 修（RQ2）。1.3.0 前一律 exit 1。
 - 映像自己驗自己有循環信任的疑慮；要獨立驗證，用原生安裝的 sbomgate（`sbomgate verify-toolkit --image "$TK"`），或直接用 cosign 與 trusted-keys.yaml 裡的公鑰：
   `cosign verify --key cosign.pub --insecure-ignore-tlog "$TK"`
 

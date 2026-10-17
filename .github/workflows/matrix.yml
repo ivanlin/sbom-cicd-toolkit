@@ -7,6 +7,7 @@
 # the container and native jobs, and a keyless `verify-release --skip-signature` smoke that
 # exercises gate.json schema 2 (artifacts[] hashes + source.git_sha binding, RQ9/RQ10) offline.
 # Signing itself is never done in CI (D2); scripts/test-signing.sh covers it on the mac mini.
+# 1.3.0 adds: scripts/exit-codes-container.sh — the dedicated exit codes (64/5/4/3/0) in both container jobs.
 name: platform-matrix
 on:
   push: { branches: [ main ] }
@@ -22,6 +23,8 @@ jobs:
       - name: check-tools inside the image (every binary matches tools.lock)
         run: docker run --rm toolkit:ci check-tools
       - run: scripts/fixtures-container.sh toolkit:ci "github-actions/ubuntu-latest/linux-amd64/container" out
+      - name: exit-code contract (1.3.0) — usage 64, policy 5, untrusted 4, unavailable 3 (no network, empty DB cache)
+        run: scripts/exit-codes-container.sh toolkit:ci out/exit-codes && jq . out/exit-codes/result.json >> "$GITHUB_STEP_SUMMARY"
       - run: jq . out/result.json >> "$GITHUB_STEP_SUMMARY" && echo >> "$GITHUB_STEP_SUMMARY" && cat out/vuln/summary.md >> "$GITHUB_STEP_SUMMARY"
         if: always()
       - name: verify-release smoke — scan clean-app with git context, then verify artifacts + sha offline, no key
@@ -49,6 +52,8 @@ jobs:
       - name: check-tools inside the image (every binary matches tools.lock)
         run: docker run --rm toolkit:ci check-tools
       - run: scripts/fixtures-container.sh toolkit:ci "github-actions/ubuntu-24.04-arm/linux-arm64/container" out
+      - name: exit-code contract (1.3.0)
+        run: scripts/exit-codes-container.sh toolkit:ci out/exit-codes && jq . out/exit-codes/result.json >> "$GITHUB_STEP_SUMMARY"
       - run: jq . out/result.json >> "$GITHUB_STEP_SUMMARY"
         if: always()
       - uses: actions/upload-artifact@v4

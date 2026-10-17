@@ -14,17 +14,59 @@
 #   sbomgate key-status --pub cosign.pub [--trusted-keys F] [--at YYYY-MM-DD] [--json]
 #   sbomgate tools        # versions of every bundled tool, as JSON
 #   sbomgate version      # toolkit version
+#   sbomgate exit-codes [--json]   # the exit-code contract below
 #
-# Exit codes: 0 gate PASS / verification PASS · 2 gate FAIL · 1 tool/usage/policy/verification error.
+# Exit codes (1.3.0+; a caller can branch on them without reading any text):
+#   0  PASS            gate passed / verification passed
+#   1  ERROR           unclassified tool error (anything not below; every error was 1 before 1.3.0)
+#   2  FINDINGS        CVEs at or above --fail-on (also when a cross-check scanner was unavailable)
+#   3  UNAVAILABLE     an external resource could not be got: vulnerability DB download, registry, network
+#   4  UNTRUSTED       signature does not verify / no usable trusted key / binary != tools.lock / evidence tampered
+#   5  POLICY          allowlist entry incomplete or expired, trusted-keys file malformed, bad --fail-on
+#   64 USAGE           unknown argument, missing required argument, wrong input path
 set -euo pipefail
 
 SBOMGATE_HOME="${SBOMGATE_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
 TOOLKIT_VERSION="$(tr -d '[:space:]' < "$SBOMGATE_HOME/VERSION" 2>/dev/null || echo 0.0.0-dev)"
 TODAY="$(date -u +%Y-%m-%d)"
+# never phone home for a newer syft/grype release: offline that check logs a network ERROR that has
+# nothing to do with the scan (and would read like an unavailable vulnerability DB)
+export GRYPE_CHECK_FOR_APP_UPDATE=false SYFT_CHECK_FOR_APP_UPDATE=false
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+EX_PASS=0 EX_ERROR=1 EX_FINDINGS=2 EX_UNAVAILABLE=3 EX_UNTRUSTED=4 EX_POLICY=5 EX_USAGE=64
 log()  { printf '[sbomgate %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
-die()  { printf '[sbomgate] ERROR: %s\n' "$*" >&2; exit 1; }
+# Every error line carries its class in brackets, so a log reader sees the same thing the exit code says.
+die()             { printf '[sbomgate] ERROR [error]: %s\n' "$*" >&2; exit "$EX_ERROR"; }
+die_usage()       { printf '[sbomgate] ERROR [usage]: %s\n' "$*" >&2; exit "$EX_USAGE"; }
+die_policy()      { printf '[sbomgate] ERROR [policy]: %s\n' "$*" >&2; exit "$EX_POLICY"; }
+die_unavailable() { printf '[sbomgate] ERROR [unavailable]: %s\n' "$*" >&2; exit "$EX_UNAVAILABLE"; }
+die_untrusted()   { printf '[sbomgate] ERROR [untrusted]: %s\n' "$*" >&2; exit "$EX_UNTRUSTED"; }
+# "Could not get it at all": only unambiguous network / pull / DB-download failures, and never from a
+# WARN line (grype WARNs "unable to check for vulnerability database update ... dial tcp" and then scans
+# fine with the DB it has). Prints the first matching line; returns 1 when the file names no such failure.
+NET_FAILURE_RE='dial tcp|no such host|network is unreachable|connection refused|connection reset by peer|i/o timeout|tls handshake timeout|context deadline exceeded|temporary failure in name resolution|could not resolve host|server misbehaving|failed to resolve reference|failed to do request|unable to find image|failed to download vulnerability db|failed to download artifact|unable to download listing|oci repository error|oci artifact error|vulnerability database was built.*max allowed'
+WARN_LINE_RE='(^|[^A-Za-z])WARN(ING)?([^A-Za-z]|$)'
+net_failure_line() {  # $1 file with a tool's stderr
+  [ -s "$1" ] || return 1
+  local l w; l="$(grep -v -E "$WARN_LINE_RE" "$1" | grep -i -E -m1 "$NET_FAILURE_RE" || true)"
+  if [ -z "$l" ]; then
+    # grype's own shape when it has no usable DB and cannot fetch one: the refresh failure is logged
+    # at WARN, the fatal line only says the DB would not load. Both halves are needed: a DB that does
+    # not load for any other reason (corrupt file, full disk) stays an ordinary error.
+    l="$(grep -v -E "$WARN_LINE_RE" "$1" | grep -i -E -m1 'failed to load vulnerability db' || true)"
+    w="$(grep -E "$WARN_LINE_RE" "$1" | grep -i -E -m1 "$NET_FAILURE_RE" || true)"
+    [ -n "$l" ] && [ -n "$w" ] || return 1
+    l="$l (DB refresh failed: $w)"
+  fi
+  printf '%s' "$l" | sed "s/$(printf '\033')\[[0-9;]*m//g" | cut -c1-400
+}
+net_endpoints() {  # $1 file -> JSON array of hosts named by URL or "lookup <host>" on the deciding lines (max 3)
+  { grep -v -E "$WARN_LINE_RE" "$1" 2>/dev/null | grep -i -E "$NET_FAILURE_RE"
+    grep -E "$WARN_LINE_RE" "$1" 2>/dev/null | grep -i -E "$NET_FAILURE_RE"; } \
+    | grep -o -E 'https?://[A-Za-z0-9.-]+(:[0-9]+)?|lookup [A-Za-z0-9.-]+' \
+    | sed -E 's#^https?://##; s#^lookup ##; s#[.]$##' | awk '!seen[$0]++' | head -3 | jq -R -s 'split("\n") | map(select(length > 0))'
+}
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool not on PATH: $1"; }
 # bind mounts are often owned by another uid: without safe.directory git refuses and the git filter would silently skip
 g() { git -c safe.directory='*' "$@"; }
@@ -45,7 +87,7 @@ date_add_days() {  # $1 YYYY-MM-DD  $2 signed integer days -> YYYY-MM-DD (GNU da
   date -u -d "$1 $2 days" +%Y-%m-%d 2>/dev/null || date -u -j -v"${n}d" -f %Y-%m-%d "$1" +%Y-%m-%d
 }
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
 
 runtime_kind() {
   if [ -n "${SBOMGATE_RUNTIME:-}" ]; then printf '%s' "$SBOMGATE_RUNTIME"
@@ -72,7 +114,7 @@ tool_versions_json() {
 sev_rank() {  # CRITICAL=4 HIGH=3 MEDIUM=2 LOW=1 none=0
   case "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')" in
     CRITICAL) echo 4;; HIGH) echo 3;; MEDIUM) echo 2;; LOW) echo 1;; NONE) echo 0;;
-    *) die "--fail-on must be one of CRITICAL|HIGH|MEDIUM|LOW|none (got '$1')";;
+    *) die_policy "--fail-on must be one of CRITICAL|HIGH|MEDIUM|LOW|none (got '$1')";;
   esac
 }
 
@@ -85,7 +127,7 @@ sev_rank() {  # CRITICAL=4 HIGH=3 MEDIUM=2 LOW=1 none=0
 #       reason: why this is acceptable    (required)
 #       approved_by: Name <email>         (required)
 #       approved_on: YYYY-MM-DD           (required)
-#       expires: YYYY-MM-DD               (required; past date = policy error, exit 1)
+#       expires: YYYY-MM-DD               (required; past date = policy error, exit 5)
 render_allowlist() {  # $1 allowlist.yaml  $2 grype-config-out  $3 exemptions-json-out
   need yq
   local n i vuln pkg reason by on exp
@@ -102,9 +144,9 @@ render_allowlist() {  # $1 allowlist.yaml  $2 grype-config-out  $3 exemptions-js
     on="$(yq -r ".exemptions[$i].approved_on // \"\"" "$1")"
     exp="$(yq -r ".exemptions[$i].expires // \"\"" "$1")"
     [ -n "$vuln" ] && [ -n "$reason" ] && [ -n "$by" ] && [ -n "$on" ] && [ -n "$exp" ] \
-      || die "allowlist entry #$i is incomplete: vulnerability, reason, approved_by, approved_on, expires are all required"
-    printf '%s' "$exp" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || die "allowlist entry #$i: expires must be YYYY-MM-DD"
-    if [ "$exp" \< "$TODAY" ]; then die "allowlist entry #$i ($vuln) EXPIRED on $exp — renew the approval or remove it"; fi
+      || die_policy "allowlist entry #$i is incomplete: vulnerability, reason, approved_by, approved_on, expires are all required"
+    printf '%s' "$exp" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || die_policy "allowlist entry #$i: expires must be YYYY-MM-DD"
+    if [ "$exp" \< "$TODAY" ]; then die_policy "allowlist entry #$i ($vuln) EXPIRED on $exp — renew the approval or remove it"; fi
     printf '  - vulnerability: "%s"\n' "$vuln" >> "$2"
     [ -n "$pkg" ] && printf '    package:\n      name: "%s"\n' "$pkg" >> "$2"
     [ "$i" -gt 0 ] && printf ',' >> "$3"
@@ -143,15 +185,15 @@ cmd_scan() {
       --exclude) EXCL_ARGS+=(--exclude "$2"); shift 2;; --no-git-filter) GIT_FILTER=0; shift;;
       --source-url) SOURCE_URL="$2"; SOURCE_URL_SET=1; shift 2;; --source-ref) SOURCE_REF="$2"; shift 2;;
       -h|--help) usage; exit 0;;
-      *) die "unknown argument: $1";;
+      *) die_usage "unknown argument: $1";;
     esac
   done
-  [ -n "$SRC" ] || [ -n "$IMAGE_TAR" ] || [ -n "$IMAGE_REF" ] || die "--source DIR (and/or --image-tar / --image) is required"
+  [ -n "$SRC" ] || [ -n "$IMAGE_TAR" ] || [ -n "$IMAGE_REF" ] || die_usage "--source DIR (and/or --image-tar / --image) is required"
   need syft; need grype; need jq
   [ "$NO_TRIVY" = 1 ] || need trivy
   local rank; rank="$(sev_rank "$FAIL_ON")"
 
-  if [ -n "$SRC" ]; then [ -d "$SRC" ] || die "--source $SRC is not a directory"; SRC="$(cd "$SRC" && pwd)"; fi
+  if [ -n "$SRC" ]; then [ -d "$SRC" ] || die_usage "--source $SRC is not a directory"; SRC="$(cd "$SRC" && pwd)"; fi
   [ -n "$OUT" ] || OUT="${SRC:-.}/sbom-out"
   mkdir -p "$OUT/sbom" "$OUT/scan" "$OUT/gate"; OUT="$(cd "$OUT" && pwd)"
   [ -n "$NAME" ] || NAME="$(basename "${SRC:-${IMAGE_REF:-${IMAGE_TAR}}}" | sed 's/[^A-Za-z0-9._-]/_/g')"
@@ -176,11 +218,31 @@ cmd_scan() {
   # allowlist
   local GRYPE_CFG="$OUT/gate/grype-ignore.yaml" EXEMPT="$OUT/gate/exemptions.json"
   if [ -n "$ALLOW" ]; then
-    [ -f "$ALLOW" ] || die "--allowlist $ALLOW not found"
+    [ -f "$ALLOW" ] || die_usage "--allowlist $ALLOW not found"
     render_allowlist "$ALLOW" "$GRYPE_CFG" "$EXEMPT"
   else
     printf 'ignore: []\n' > "$GRYPE_CFG"; printf '[]' > "$EXEMPT"; log "allowlist: none"
   fi
+
+  # A rerun into the same --out must never leave an older verdict or scan behind for a reader to mistake
+  # for this run's (an unavailable scanner writes no scan file this time).
+  rm -f "$OUT/gate.json" "$OUT/gate/gate.json" "$OUT"/gate/norm.*.json "$OUT"/gate/meta.grype.*.json \
+        "$OUT"/scan/grype.*.json "$OUT"/scan/trivy.*.json "$OUT/gate/.unavailable.jsonl"
+  local ERRD="$OUT/gate/stderr" UNAVF="$OUT/gate/.unavailable.jsonl" GRYPE_COMPLETE=1 rc line
+  mkdir -p "$ERRD"; : > "$UNAVF"
+  # run a tool with its stderr kept in a file (still echoed to the log), so a failure can be classified
+  run_capture() { local e="$1"; shift; local r=0; "$@" 2>"$e" || r=$?; [ -s "$e" ] && cat "$e" >&2; return "$r"; }
+  record_unavailable() {  # $1 scanner/step  $2 kind  $3 stderr file  $4 deciding line
+    jq -cn --arg s "$1" --arg k "$2" --arg d "$4" --argjson e "$(net_endpoints "$3")" \
+      '{scanner:$s, kind:$k, endpoints:$e, detail:$d}' >> "$UNAVF"
+  }
+  syft_or_die() {  # $1 label  $2 stderr file  $@ syft args
+    local what="$1" e="$2" r=0 l; shift 2
+    run_capture "$e" syft "$@" || r=$?
+    [ "$r" = 0 ] && return 0
+    if l="$(net_failure_line "$e")"; then die_unavailable "syft could not get the $what: $l"; fi
+    die "syft exited $r on the $what (see messages above)"
+  }
 
   # SBOMs
   local KINDS=""
@@ -205,25 +267,27 @@ cmd_scan() {
     local excl=""
     case "$OUT" in "$SRC"/*) excl="--exclude ./${OUT#"$SRC"/}/**";; esac
     # shellcheck disable=SC2086
-    syft scan "dir:$(wpath "$SCAN_DIR")" -q --source-name "$NAME" --source-version "$LABEL" --exclude './.git/**' $excl ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} \
+    syft_or_die "source tree" "$ERRD/syft.source.err" scan "dir:$(wpath "$SCAN_DIR")" -q --source-name "$NAME" --source-version "$LABEL" --exclude './.git/**' $excl ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} \
       -o "cyclonedx-json=$(wpath "$OUT/sbom/$NAME.source.cdx.json")" -o "spdx-json=$(wpath "$OUT/sbom/$NAME.source.spdx.json")"
     [ "$SCAN_DIR" = "$SRC" ] || rm -rf "$SCAN_DIR"
     KINDS="source"
   fi
   if [ -n "$IMAGE_TAR" ]; then
-    [ -f "$IMAGE_TAR" ] || die "--image-tar $IMAGE_TAR not found"
+    [ -f "$IMAGE_TAR" ] || die_usage "--image-tar $IMAGE_TAR not found"
     log "syft: image SBOM of docker-archive:$IMAGE_TAR"
-    syft scan "docker-archive:$(wpath "$IMAGE_TAR")" -q --source-name "$NAME-image" --source-version "$LABEL" \
+    syft_or_die "image tar" "$ERRD/syft.image.err" scan "docker-archive:$(wpath "$IMAGE_TAR")" -q --source-name "$NAME-image" --source-version "$LABEL" \
       -o "cyclonedx-json=$(wpath "$OUT/sbom/$NAME.image.cdx.json")" -o "spdx-json=$(wpath "$OUT/sbom/$NAME.image.spdx.json")"
     KINDS="$KINDS image"
   elif [ -n "$IMAGE_REF" ]; then
     log "syft: image SBOM of docker:$IMAGE_REF (needs the docker socket)"
-    syft scan "docker:$IMAGE_REF" -q --source-name "$NAME-image" --source-version "$LABEL" \
+    syft_or_die "image $IMAGE_REF" "$ERRD/syft.image.err" scan "docker:$IMAGE_REF" -q --source-name "$NAME-image" --source-version "$LABEL" \
       -o "cyclonedx-json=$(wpath "$OUT/sbom/$NAME.image.cdx.json")" -o "spdx-json=$(wpath "$OUT/sbom/$NAME.image.spdx.json")"
     KINDS="$KINDS image"
   fi
 
-  # Scans
+  # Scans. grype COUNTS (the gate verdict); trivy cross-checks. A scanner that cannot get its
+  # vulnerability DB (network / registry / a stale DB that cannot be refreshed) is recorded as
+  # unavailable instead of killing the run, so whatever DID run still decides what it can.
   local kind of="" sboms="[]"
   [ "$ONLY_FIXED" = 1 ] && of="--only-fixed"
   for kind in $KINDS; do
@@ -233,49 +297,77 @@ cmd_scan() {
       --arg cv "$(jq -r '.specVersion' "$cdx")" --arg sv "$(jq -r '.spdxVersion' "$spdx")" \
       '. + [{kind:$k, cyclonedx:{file:$c, spec:$cv, components:$nc}, spdx:{file:$s, spec:$sv, packages:$ns}}]' <<<"$sboms")"
     log "grype: $kind ($(jq '.components|length' "$cdx") components)"
+    rc=0
     # shellcheck disable=SC2086
-    grype "sbom:$(wpath "$cdx")" -q -o json --file "$(wpath "$OUT/scan/grype.$kind.json")" -c "$(wpath "$GRYPE_CFG")" $of \
-      || die "grype exited $? on $kind SBOM (vulnerability DB download or match failure — see messages above; check disk space and network)"
-    [ -s "$OUT/scan/grype.$kind.json" ] || die "grype produced no output for $kind SBOM ($OUT/scan/grype.$kind.json is empty)"
-    jq --arg k "$kind" '[ .matches[] | {id:.vulnerability.id, severity:(.vulnerability.severity|ascii_upcase),
-        package:.artifact.name, version:.artifact.version, type:.artifact.type,
-        fixed_in:((.vulnerability.fix.versions // [])|join(", ")), fix_state:(.vulnerability.fix.state // "unknown"),
-        kind:$k, scanner:"grype"} ] | unique_by(.id,.package,.version)' "$OUT/scan/grype.$kind.json" > "$OUT/gate/norm.grype.$kind.json"
-    jq '{ignored:(.ignoredMatches // [] | length), db:(.descriptor.db // {} | {built: (.built // .status.built // null), schema: (.schemaVersion // .status.schemaVersion // null)})}' \
-      "$OUT/scan/grype.$kind.json" > "$OUT/gate/meta.grype.$kind.json"
+    run_capture "$ERRD/grype.$kind.err" grype "sbom:$(wpath "$cdx")" -o json --file "$(wpath "$OUT/scan/grype.$kind.json")" -c "$(wpath "$GRYPE_CFG")" $of || rc=$?
+    if [ "$rc" != 0 ] || [ ! -s "$OUT/scan/grype.$kind.json" ]; then
+      if line="$(net_failure_line "$ERRD/grype.$kind.err")"; then
+        log "grype: $kind UNAVAILABLE (exit $rc) — $line"
+        record_unavailable grype "$kind" "$ERRD/grype.$kind.err" "$line"
+        rm -f "$OUT/scan/grype.$kind.json"; printf '[]' > "$OUT/gate/norm.grype.$kind.json"
+        printf '{"ignored":0,"db":{}}' > "$OUT/gate/meta.grype.$kind.json"; GRYPE_COMPLETE=0
+      elif [ "$rc" != 0 ]; then
+        die "grype exited $rc on $kind SBOM (match failure — see messages above; check disk space)"
+      else
+        die "grype produced no output for $kind SBOM ($OUT/scan/grype.$kind.json is empty)"
+      fi
+    else
+      jq --arg k "$kind" '[ .matches[] | {id:.vulnerability.id, severity:(.vulnerability.severity|ascii_upcase),
+          package:.artifact.name, version:.artifact.version, type:.artifact.type,
+          fixed_in:((.vulnerability.fix.versions // [])|join(", ")), fix_state:(.vulnerability.fix.state // "unknown"),
+          kind:$k, scanner:"grype"} ] | unique_by(.id,.package,.version)' "$OUT/scan/grype.$kind.json" > "$OUT/gate/norm.grype.$kind.json"
+      jq '{ignored:(.ignoredMatches // [] | length), db:(.descriptor.db // {} | {built: (.built // .status.built // null), schema: (.schemaVersion // .status.schemaVersion // null)})}' \
+        "$OUT/scan/grype.$kind.json" > "$OUT/gate/meta.grype.$kind.json"
+    fi
     if [ "$NO_TRIVY" = 0 ]; then
       log "trivy: $kind"
-      trivy sbom "$(wpath "$cdx")" -q --format json --output "$(wpath "$OUT/scan/trivy.$kind.json")" --scanners vuln \
-        || die "trivy exited $? on $kind SBOM (vulnerability DB download or scan failure — see messages above)"
-      [ -s "$OUT/scan/trivy.$kind.json" ] || die "trivy produced no output for $kind SBOM"
-      jq --arg k "$kind" '[ (.Results // [])[] | (.Vulnerabilities // [])[] | {id:.VulnerabilityID, severity:(.Severity|ascii_upcase),
-          package:.PkgName, version:.InstalledVersion, fixed_in:(.FixedVersion // ""), kind:$k, scanner:"trivy"} ] | unique_by(.id,.package,.version)' \
-          "$OUT/scan/trivy.$kind.json" > "$OUT/gate/norm.trivy.$kind.json"
+      rc=0
+      run_capture "$ERRD/trivy.$kind.err" trivy sbom "$(wpath "$cdx")" -q --format json --output "$(wpath "$OUT/scan/trivy.$kind.json")" --scanners vuln || rc=$?
+      if [ "$rc" != 0 ] || [ ! -s "$OUT/scan/trivy.$kind.json" ]; then
+        if line="$(net_failure_line "$ERRD/trivy.$kind.err")"; then
+          log "trivy: $kind UNAVAILABLE (exit $rc) — $line"
+          record_unavailable trivy "$kind" "$ERRD/trivy.$kind.err" "$line"
+          rm -f "$OUT/scan/trivy.$kind.json"; printf '[]' > "$OUT/gate/norm.trivy.$kind.json"
+        elif [ "$rc" != 0 ]; then
+          die "trivy exited $rc on $kind SBOM (scan failure — see messages above)"
+        else
+          die "trivy produced no output for $kind SBOM"
+        fi
+      else
+        jq --arg k "$kind" '[ (.Results // [])[] | (.Vulnerabilities // [])[] | {id:.VulnerabilityID, severity:(.Severity|ascii_upcase),
+            package:.PkgName, version:.InstalledVersion, fixed_in:(.FixedVersion // ""), kind:$k, scanner:"trivy"} ] | unique_by(.id,.package,.version)' \
+            "$OUT/scan/trivy.$kind.json" > "$OUT/gate/norm.trivy.$kind.json"
+      fi
     else
       printf '[]' > "$OUT/gate/norm.trivy.$kind.json"
     fi
   done
 
-  # Gate
-  local RESULT counted exit_code ARTS
+  # Gate. Order of certainty: CVEs really found (2) > something could not be got (3) > PASS (0).
+  local RESULT counted counted_json exit_code ARTS UNAV n_unav
   jq -s 'add // []' "$OUT"/gate/norm.grype.*.json > "$OUT/gate/findings.grype.json"
   jq -s 'add // []' "$OUT"/gate/norm.trivy.*.json > "$OUT/gate/findings.trivy.json"
-  jq -s '{ignored:(map(.ignored)|add // 0), db:(.[0].db // {})}' "$OUT"/gate/meta.grype.*.json > "$OUT/gate/meta.grype.json"
+  jq -s '{ignored:(map(.ignored)|add // 0), db:(map(select(.db != {}))[0].db // {})}' "$OUT"/gate/meta.grype.*.json > "$OUT/gate/meta.grype.json"
+  UNAV="$(jq -s '.' "$UNAVF")"; rm -f "$UNAVF"; n_unav="$(jq 'length' <<<"$UNAV")"
   counted="$(jq --argjson r "$rank" '
       def rk: if .=="CRITICAL" then 4 elif .=="HIGH" then 3 elif .=="MEDIUM" then 2 elif .=="LOW" then 1 else 0 end;
       if $r == 0 then 0 else [ .[] | select((.severity|rk) >= $r) ] | length end' "$OUT/gate/findings.grype.json")"
-  if [ "$counted" -gt 0 ]; then RESULT=FAIL; exit_code=2; else RESULT=PASS; exit_code=0; fi
+  if [ "$counted" -gt 0 ]; then RESULT=FAIL; exit_code="$EX_FINDINGS"
+  elif [ "$n_unav" -gt 0 ]; then RESULT=UNAVAILABLE; exit_code="$EX_UNAVAILABLE"
+  else RESULT=PASS; exit_code="$EX_PASS"; fi
+  # a count from an incomplete grype run is only a number when it found something
+  counted_json="$counted"; [ "$GRYPE_COMPLETE" = 1 ] || [ "$counted" -gt 0 ] || counted_json=null
   # artifacts[] (schema 2, RQ9): hashed immediately before gate.json is written; gate.json itself,
   # gate/gate.json, summary.md and sbomgate.log are written after / streamed and are NOT listed.
   ARTS="$OUT/gate/.artifacts.json"
   artifacts_json "$OUT" > "$ARTS"
 
-  jq -n --arg result "$RESULT" --argjson counted "$counted" --arg fail_on "$(printf '%s' "$FAIL_ON" | tr '[:lower:]' '[:upper:]')" \
+  jq -n --arg result "$RESULT" --argjson counted "$counted_json" --arg fail_on "$(printf '%s' "$FAIL_ON" | tr '[:lower:]' '[:upper:]')" \
      --argjson only_fixed "$([ "$ONLY_FIXED" = 1 ] && echo true || echo false)" \
      --arg allow "${ALLOW:-}" --slurpfile exemptions "$EXEMPT" --slurpfile tools "$OUT/gate/tools.json" \
      --arg now "$NOW" --arg name "$NAME" --arg label "$LABEL" --arg src "${SRC:-}" --arg tar "${IMAGE_TAR:-}" --arg ref "${IMAGE_REF:-}" \
      --arg sha "$GIT_SHA" --arg dirty "$GIT_DIRTY" --argjson sboms "$sboms" --argjson exit_code "$exit_code" \
-     --arg gitfilter "${SNAP_FILES:-off}" --arg excludes "${EXCL_ARGS[*]-}" \
+     --arg gitfilter "${SNAP_FILES:-off}" --arg excludes "${EXCL_ARGS[*]-}" --argjson unav "$UNAV" \
      --slurpfile g "$OUT/gate/findings.grype.json" --slurpfile t "$OUT/gate/findings.trivy.json" --slurpfile gm "$OUT/gate/meta.grype.json" \
      --arg image_digest "${SBOMGATE_IMAGE_DIGEST:-}" --arg src_url "$SOURCE_URL" --arg src_ref "$SOURCE_REF" --slurpfile arts "$ARTS" '
      def counts: reduce .[] as $f ({CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0,NEGLIGIBLE:0,UNKNOWN:0}; .[$f.severity] += 1);
@@ -289,6 +381,7 @@ cmd_scan() {
       grype:{db:$gm[0].db, total:($g[0]|counts), by_kind:($g[0]|by_kind)},
       trivy:{total:($t[0]|counts), by_kind:($t[0]|by_kind)},
       findings_critical_high:[ $g[0][] | select(.severity=="CRITICAL" or .severity=="HIGH") ],
+      unavailable:$unav,
       source:{remote_url:$src_url, git_sha:$sha, git_ref:$src_ref},
       artifacts:$arts[0] }' > "$OUT/gate/gate.json"
   rm -f "$ARTS"
@@ -297,7 +390,7 @@ cmd_scan() {
   # Human summary
   {
     printf '# sbomgate %s — %s\n\n' "$TOOLKIT_VERSION" "$NAME"
-    printf -- '- result: **%s** (fail_on=%s, counted=%s, exit=%s)\n' "$RESULT" "$FAIL_ON" "$counted" "$exit_code"
+    printf -- '- result: **%s** (fail_on=%s, counted=%s, exit=%s)\n' "$RESULT" "$FAIL_ON" "$counted_json" "$exit_code"
     printf -- '- label: %s · git: %s%s · %s\n' "$LABEL" "${GIT_SHA:-n/a}" "${GIT_DIRTY:+ ($GIT_DIRTY)}" "$NOW"
     printf -- '- platform: %s · tools: %s\n' "$(jq -c .platform "$OUT/gate/tools.json")" "$(jq -c 'del(.platform,.toolkit)' "$OUT/gate/tools.json")"
     printf '\n| SBOM | CycloneDX | components | SPDX | packages |\n|---|---|---|---|---|\n'
@@ -306,28 +399,33 @@ cmd_scan() {
     jq -r '"| grype | \(.grype.total.CRITICAL) | \(.grype.total.HIGH) | \(.grype.total.MEDIUM) | \(.grype.total.LOW) | \(.grype.total.NEGLIGIBLE) | \(.grype.total.UNKNOWN) |",
            "| trivy | \(.trivy.total.CRITICAL) | \(.trivy.total.HIGH) | \(.trivy.total.MEDIUM) | \(.trivy.total.LOW) | \(.trivy.total.NEGLIGIBLE) | \(.trivy.total.UNKNOWN) |"' "$OUT/gate.json"
     printf '\n- exemptions applied: %s (grype ignored %s match(es))\n' "$(jq '.policy.exemptions|length' "$OUT/gate.json")" "$(jq '.policy.grype_ignored_matches' "$OUT/gate.json")"
+    if [ "$n_unav" -gt 0 ]; then
+      printf '\n## UNAVAILABLE (not scanned — not a CVE verdict, not a signature problem)\n\n| scanner | kind | endpoints | detail |\n|---|---|---|---|\n'
+      jq -r '.unavailable[] | "| \(.scanner) | \(.kind) | \(.endpoints | join(", ")) | \(.detail | gsub("\\|"; "/")) |"' "$OUT/gate.json"
+    fi
     if [ "$(jq '.findings_critical_high|length' "$OUT/gate.json")" -gt 0 ]; then
       printf '\n## CRITICAL / HIGH (grype)\n\n| severity | id | package | version | fixed in | kind |\n|---|---|---|---|---|---|\n'
       jq -r '.findings_critical_high | sort_by(.severity,.id)[] | "| \(.severity) | \(.id) | \(.package) | \(.version) | \(.fixed_in) | \(.kind) |"' "$OUT/gate.json"
     fi
   } > "$OUT/summary.md"
   cat "$OUT/summary.md" >&2
-  if [ "$RESULT" = FAIL ]; then
-    log "GATE FAIL: $counted finding(s) at or above $FAIL_ON — see $OUT/gate.json"
-  else
-    log "GATE PASS: no finding at or above $FAIL_ON"
-  fi
+  case "$RESULT" in
+    FAIL) if [ "$n_unav" -gt 0 ]; then line=" (also unavailable, not scanned: $(jq -r '[.[].scanner] | unique | join(", ")' <<<"$UNAV"))"; else line=""; fi
+          log "GATE FAIL: $counted finding(s) at or above $FAIL_ON — see $OUT/gate.json$line";;
+    UNAVAILABLE) log "GATE UNAVAILABLE (exit $EX_UNAVAILABLE): $(jq -r '[.[] | "\(.scanner)/\(.kind)"] | join(", ")' <<<"$UNAV") could not get an external resource ($(jq -r '[.[].endpoints[]] | unique | join(", ") | if . == "" then "endpoint not named" else . end' <<<"$UNAV")) — $(if [ "$GRYPE_COMPLETE" = 1 ]; then printf 'grype found nothing at or above %s, but the run is incomplete' "$FAIL_ON"; else printf 'grype did not run: there is NO CVE verdict'; fi); not a signature problem; re-run when it is reachable";;
+    *) log "GATE PASS: no finding at or above $FAIL_ON";;
+  esac
   exit "$exit_code"
 }
 
 # ── trusted keys (RQ3) ───────────────────────────────────────────────────────
 # A key is USABLE at date T iff status == active AND valid_from <= T <= valid_until.
 resolve_trusted_keys() {  # $1 explicit --trusted-keys (may be empty) -> path on stdout
-  if [ -n "$1" ]; then [ -f "$1" ] || die "--trusted-keys $1 not found"; printf '%s' "$1"; return; fi
-  if [ -n "${SBOMGATE_TRUSTED_KEYS:-}" ]; then [ -f "$SBOMGATE_TRUSTED_KEYS" ] || die "SBOMGATE_TRUSTED_KEYS=$SBOMGATE_TRUSTED_KEYS not found"; printf '%s' "$SBOMGATE_TRUSTED_KEYS"; return; fi
+  if [ -n "$1" ]; then [ -f "$1" ] || die_policy "--trusted-keys $1 not found"; printf '%s' "$1"; return; fi
+  if [ -n "${SBOMGATE_TRUSTED_KEYS:-}" ]; then [ -f "$SBOMGATE_TRUSTED_KEYS" ] || die_policy "SBOMGATE_TRUSTED_KEYS=$SBOMGATE_TRUSTED_KEYS not found"; printf '%s' "$SBOMGATE_TRUSTED_KEYS"; return; fi
   if [ -f "$SBOMGATE_HOME/trusted-keys.yaml" ]; then printf '%s' "$SBOMGATE_HOME/trusted-keys.yaml"; return; fi
   if [ -f "$SBOMGATE_HOME/policy/trusted-keys.yaml" ]; then printf '%s' "$SBOMGATE_HOME/policy/trusted-keys.yaml"; return; fi
-  die "no trusted-keys.yaml (tried --trusted-keys, \$SBOMGATE_TRUSTED_KEYS, $SBOMGATE_HOME/trusted-keys.yaml, $SBOMGATE_HOME/policy/trusted-keys.yaml)"
+  die_policy "no trusted-keys.yaml (tried --trusted-keys, \$SBOMGATE_TRUSTED_KEYS, $SBOMGATE_HOME/trusted-keys.yaml, $SBOMGATE_HOME/policy/trusted-keys.yaml)"
 }
 pem_fingerprint() {  # PEM public key on stdin -> hex sha256 of the DER SubjectPublicKeyInfo ("" if no PEM)
   local b64
@@ -340,9 +438,9 @@ hint_to_hex() { printf '%s' "$1" | b64decode | od -An -v -tx1 | tr -d ' \n'; }
 load_trusted_keys() {
   local f="$1" d="$2" n i pem fp_calc fp_decl err
   need yq; need jq
-  yq -o=json '.' "$f" > "$d/raw.json" 2>"$d/yq.err" || die "trusted keys $f: not valid YAML ($(head -1 "$d/yq.err"))"
-  [ "$(jq -r '.version // empty' "$d/raw.json")" = "1" ] || die "trusted keys $f: version must be 1"
-  jq -e '(.keys // []) | type == "array"' "$d/raw.json" >/dev/null || die "trusted keys $f: keys must be a list"
+  yq -o=json '.' "$f" > "$d/raw.json" 2>"$d/yq.err" || die_policy "trusted keys $f: not valid YAML ($(head -1 "$d/yq.err"))"
+  [ "$(jq -r '.version // empty' "$d/raw.json")" = "1" ] || die_policy "trusted keys $f: version must be 1"
+  jq -e '(.keys // []) | type == "array"' "$d/raw.json" >/dev/null || die_policy "trusted keys $f: keys must be a list"
   n="$(jq '(.keys // []) | length' "$d/raw.json")"
   printf '[' > "$d/keys.json"
   i=0
@@ -384,23 +482,25 @@ cmd_verify_release() {
       --trusted-keys) TK="$2"; shift 2;; --at) AT="$2"; shift 2;;
       --allow-fail-result) ALLOW_FAIL=1; shift;; --skip-signature) SKIP_SIG=1; shift;;
       --json) JSON=1; shift;; -h|--help) usage; exit 0;;
-      *) die "unknown argument: $1";;
+      *) die_usage "unknown argument: $1";;
     esac
   done
-  [ -n "$DIR" ] || die "--bundle-dir DIR is required"
-  [ -d "$DIR" ] || die "--bundle-dir $DIR is not a directory"
-  is_date "$AT" || die "--at must be YYYY-MM-DD (got '$AT')"
+  [ -n "$DIR" ] || die_usage "--bundle-dir DIR is required"
+  [ -d "$DIR" ] || die_usage "--bundle-dir $DIR is not a directory"
+  is_date "$AT" || die_usage "--at must be YYYY-MM-DD (got '$AT')"
   need jq
   DIR="$(cd "$DIR" && pwd)"
   local W; W="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf '$W'" EXIT
   : > "$W/checks.jsonl"; : > "$W/bundles.jsonl"; : > "$W/verified"
-  local FAILED=0
+  local FAILED=0 FAILED_TRUST=0
   chk() {  # $1 PASS|FAIL|SKIP|WARN  $2 name  $3 detail
     printf '%-4s %s: %s\n' "$1" "$2" "$3" >&2
     jq -cn --arg s "$1" --arg n "$2" --arg d "$3" '{name:$n, status:$s, detail:$d}' >> "$W/checks.jsonl"
-    [ "$1" = FAIL ] && FAILED=1
+    # a failed gate-result alone is a signed FAIL verdict (exit 2); any other failed check means the
+    # evidence itself cannot be trusted (exit 4)
+    if [ "$1" = FAIL ]; then FAILED=1; [ "$2" = gate-result ] || FAILED_TRUST=1; fi
     return 0
   }
   finish() {
@@ -411,8 +511,9 @@ cmd_verify_release() {
         --arg v "$(sort -u "$W/verified" | tr '\n' ' ')" \
         '{result:$r, bundle_dir:$dir, at:$at, checks:$c, bundles:$b, key_ids_verified:($v | split(" ") | map(select(length > 0)))}'
     fi
-    [ "$result" = PASS ] && exit 0
-    exit 1
+    [ "$result" = PASS ] && exit "$EX_PASS"
+    [ "$FAILED_TRUST" = 1 ] && exit "$EX_UNTRUSTED"
+    exit "$EX_FINDINGS"
   }
   printf '[verify-release] %s · sbom-cicd-toolkit %s · at %s\n' "$DIR" "$TOOLKIT_VERSION" "$AT" >&2
 
@@ -537,17 +638,17 @@ cmd_verify_toolkit() {
     case "$1" in
       --image) IMG="$2"; shift 2;; --trusted-keys) TK="$2"; shift 2;; --at) AT="$2"; shift 2;;
       --attestation) ATT=1; shift;; --json) JSON=1; shift;; -h|--help) usage; exit 0;;
-      *) die "unknown argument: $1";;
+      *) die_usage "unknown argument: $1";;
     esac
   done
-  [ -n "$IMG" ] || die "--image REF@sha256:<digest> is required"
-  printf '%s' "$IMG" | grep -Eq '@sha256:[0-9a-f]{64}$' || die "--image $IMG: pin the digest (REF@sha256:<64 hex>); a tag-only reference is not verifiable"
-  is_date "$AT" || die "--at must be YYYY-MM-DD (got '$AT')"
+  [ -n "$IMG" ] || die_usage "--image REF@sha256:<digest> is required"
+  printf '%s' "$IMG" | grep -Eq '@sha256:[0-9a-f]{64}$' || die_usage "--image $IMG: pin the digest (REF@sha256:<64 hex>); a tag-only reference is not verifiable"
+  is_date "$AT" || die_usage "--at must be YYYY-MM-DD (got '$AT')"
   need jq; need cosign
   local W; W="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf '$W'" EXIT
-  local TKF k id pem sig_ok="" att_ok="" tried=""
+  local TKF k id pem sig_ok="" att_ok="" tried="" net=""
   TKF="$(resolve_trusted_keys "$TK")"
   load_trusted_keys "$TKF" "$W"
   for k in $(jq -r --arg at "$AT" "$KEY_STATE_JQ"' to_entries[] | select(.value | kstate($at) == "usable") | .key' "$W/keys.json"); do
@@ -559,11 +660,14 @@ cmd_verify_toolkit() {
           att_ok="$id"; log "PASS cyclonedx attestation verified by key $id"
         else
           log "FAIL cyclonedx attestation with key $id: $(grep -v '^WARNING' "$W/a.err" | tail -1)"
+          [ -n "$net" ] || net="$(net_failure_line "$W/a.err" || true)"
         fi
       fi
       break
     else
       log "key $id: $(grep -v '^WARNING' "$W/v.err" | tail -1)"
+      # the registry (signature referrer) could not be read: that is not a verdict on the signature
+      [ -n "$net" ] || net="$(net_failure_line "$W/v.err" || true)"
     fi
   done
   local result=PASS
@@ -575,7 +679,17 @@ cmd_verify_toolkit() {
     jq -n --arg r "$result" --arg i "$IMG" --arg k "$sig_ok" --arg a "$att_ok" --argjson att "$ATT" --arg tk "$TKF" --arg at "$AT" \
       '{result:$r, image:$i, key_id:$k, attestation:(if $att == 1 then {checked:true, key_id:$a} else {checked:false} end), trusted_keys:$tk, at:$at}'
   fi
-  [ "$result" = PASS ]
+  [ "$result" = PASS ] && return "$EX_PASS"
+  if [ -n "$net" ]; then
+    printf '[sbomgate] ERROR [unavailable]: verify-toolkit could not read the signature from the registry — NOT a signature mismatch: %s\n' "$net" >&2
+    exit "$EX_UNAVAILABLE"
+  fi
+  if [ -n "$tried" ]; then
+    printf '[sbomgate] ERROR [untrusted]: no usable trusted key (tried:%s) verifies %s\n' "$tried" "$IMG" >&2
+  else
+    printf '[sbomgate] ERROR [untrusted]: no usable trusted key at %s in %s\n' "$AT" "$TKF" >&2
+  fi
+  exit "$EX_UNTRUSTED"
 }
 
 # ── check-tools (RQ11) ───────────────────────────────────────────────────────
@@ -583,10 +697,10 @@ lock_os() { case "$(host_os)" in macos) echo darwin;; *) host_os;; esac; }
 cmd_check_tools() {
   local LOCK="$SBOMGATE_HOME/tools.lock" JSON=0
   while [ $# -gt 0 ]; do
-    case "$1" in --lock) LOCK="$2"; shift 2;; --json) JSON=1; shift;; -h|--help) usage; exit 0;; *) die "unknown argument: $1";; esac
+    case "$1" in --lock) LOCK="$2"; shift 2;; --json) JSON=1; shift;; -h|--help) usage; exit 0;; *) die_usage "unknown argument: $1";; esac
   done
-  [ -f "$LOCK" ] || die "tools.lock not found: $LOCK"
-  local os arch t T ver want p got status all=ok rows=""
+  [ -f "$LOCK" ] || die_usage "tools.lock not found: $LOCK"
+  local os arch t T ver want p got status all=ok rows="" mismatch=0
   os="$(lock_os)"; arch="$(host_arch)"
   for t in syft grype trivy yq jq cosign; do
     T="$(printf '%s' "$t" | tr '[:lower:]' '[:upper:]')"
@@ -600,6 +714,7 @@ cmd_check_tools() {
       if [ -n "$want" ] && [ "$got" = "$want" ]; then status=ok; else status=MISMATCH; fi
     fi
     [ "$status" = ok ] || all=fail
+    [ "$status" = MISMATCH ] && mismatch=1
     [ -z "$want" ] && printf '[sbomgate] no %s_BIN_SHA256_%s_%s in %s\n' "$T" "$os" "$arch" "$LOCK" >&2
     [ "$status" = MISMATCH ] && [ -n "$want" ] && printf '[sbomgate] %s: %s sha256 %s, tools.lock wants %s\n' "$t" "$p" "$got" "$want" >&2
     if [ "$JSON" = 1 ]; then printf '%s %s %s %s\n' "$status" "$t" "${ver:-?}" "$got" >&2; else printf '%s %s %s %s\n' "$status" "$t" "${ver:-?}" "$got"; fi
@@ -609,7 +724,11 @@ cmd_check_tools() {
   if [ "$JSON" = 1 ]; then
     printf '%s' "$rows" | jq -s --arg r "$all" --arg os "$os" --arg arch "$arch" --arg lock "$LOCK" '{result:$r, os:$os, arch:$arch, lock:$lock, tools:.}'
   fi
-  [ "$all" = ok ]
+  [ "$all" = ok ] && return "$EX_PASS"
+  # a binary that is present and different from tools.lock is not the toolkit (4); one that is
+  # simply missing is a broken install (1)
+  [ "$mismatch" = 1 ] && exit "$EX_UNTRUSTED"
+  exit "$EX_ERROR"
 }
 
 # ── key-entry / key-status ───────────────────────────────────────────────────
@@ -619,16 +738,16 @@ cmd_key_entry() {
     case "$1" in
       --pub) PUB="$2"; shift 2;; --id) ID="$2"; shift 2;; --purpose) PURPOSE="$2"; shift 2;;
       --days) DAYS="$2"; shift 2;; --from) FROM="$2"; shift 2;; --note) NOTE="$2"; shift 2;;
-      -h|--help) usage; exit 0;; *) die "unknown argument: $1";;
+      -h|--help) usage; exit 0;; *) die_usage "unknown argument: $1";;
     esac
   done
-  [ -f "$PUB" ] || die "--pub FILE (cosign.pub) is required"
-  printf '%s' "$ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || die "--id must match [A-Za-z0-9][A-Za-z0-9._-]* (got '$ID')"
-  case "$PURPOSE" in interim|hardware) ;; *) die "--purpose must be interim|hardware";; esac
-  case "$DAYS" in ''|*[!0-9]*) die "--days N is required (interim keys: 90, RQ16)";; esac
-  is_date "$FROM" || die "--from must be YYYY-MM-DD"
+  [ -f "$PUB" ] || die_usage "--pub FILE (cosign.pub) is required"
+  printf '%s' "$ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || die_usage "--id must match [A-Za-z0-9][A-Za-z0-9._-]* (got '$ID')"
+  case "$PURPOSE" in interim|hardware) ;; *) die_usage "--purpose must be interim|hardware";; esac
+  case "$DAYS" in ''|*[!0-9]*) die_usage "--days N is required (interim keys: 90, RQ16)";; esac
+  is_date "$FROM" || die_usage "--from must be YYYY-MM-DD"
   local fp until
-  fp="$(pem_fingerprint < "$PUB")"; [ -n "$fp" ] || die "$PUB has no PEM PUBLIC KEY block"
+  fp="$(pem_fingerprint < "$PUB")"; [ -n "$fp" ] || die_usage "$PUB has no PEM PUBLIC KEY block"
   until="$(date_add_days "$FROM" "$DAYS")"
   [ -n "$NOTE" ] || NOTE="$PURPOSE key"
   printf '  - id: %s\n    purpose: %s\n    status: active\n    fingerprint: sha256:%s\n    valid_from: %s\n    valid_until: %s\n' "$ID" "$PURPOSE" "$fp" "$FROM" "$until"
@@ -640,16 +759,16 @@ cmd_key_status() {  # is the key in PUB a usable trusted key at --at? exit 0 usa
   while [ $# -gt 0 ]; do
     case "$1" in
       --pub) PUB="$2"; shift 2;; --trusted-keys) TK="$2"; shift 2;; --at) AT="$2"; shift 2;;
-      --json) JSON=1; shift;; -h|--help) usage; exit 0;; *) die "unknown argument: $1";;
+      --json) JSON=1; shift;; -h|--help) usage; exit 0;; *) die_usage "unknown argument: $1";;
     esac
   done
-  [ -f "$PUB" ] || die "--pub FILE is required"
-  is_date "$AT" || die "--at must be YYYY-MM-DD (got '$AT')"
+  [ -f "$PUB" ] || die_usage "--pub FILE is required"
+  is_date "$AT" || die_usage "--at must be YYYY-MM-DD (got '$AT')"
   local W fp TKF out
   W="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf '$W'" EXIT
-  fp="$(pem_fingerprint < "$PUB")"; [ -n "$fp" ] || die "$PUB has no PEM PUBLIC KEY block"
+  fp="$(pem_fingerprint < "$PUB")"; [ -n "$fp" ] || die_usage "$PUB has no PEM PUBLIC KEY block"
   TKF="$(resolve_trusted_keys "$TK")"
   load_trusted_keys "$TKF" "$W"
   out="$(jq -c --arg h "$fp" --arg at "$AT" --arg tk "$TKF" "$KEY_STATE_JQ"'
@@ -658,7 +777,26 @@ cmd_key_status() {  # is the key in PUB a usable trusted key at --at? exit 0 usa
       else {state:($k | kstate($at)), id:$k.id, purpose:$k.purpose, status:$k.status, valid_from:$k.valid_from, valid_until:$k.valid_until,
             fingerprint:("sha256:" + $h), trusted_keys:$tk, at:$at} end' "$W/keys.json")"
   if [ "$JSON" = 1 ]; then printf '%s\n' "$out"; else jq -r '"\(.state) \(if .id == "" then "-" else .id end) \(.fingerprint)"' <<<"$out"; fi
-  [ "$(jq -r .state <<<"$out")" = usable ]
+  [ "$(jq -r .state <<<"$out")" = usable ] && return "$EX_PASS"
+  exit "$EX_UNTRUSTED"
+}
+
+# ── exit-codes ───────────────────────────────────────────────────────────────
+cmd_exit_codes() {
+  local JSON=0
+  while [ $# -gt 0 ]; do case "$1" in --json) JSON=1; shift;; -h|--help) usage; exit 0;; *) die_usage "unknown argument: $1";; esac; done
+  local rows='0	PASS	gate passed / verification passed
+1	ERROR	unclassified tool error (every error was 1 before 1.3.0)
+2	FINDINGS	CVEs at or above --fail-on; verify-release: a validly signed FAIL verdict
+3	UNAVAILABLE	an external resource could not be got (vulnerability DB download, registry, network)
+4	UNTRUSTED	signature does not verify, no usable trusted key, binary != tools.lock, evidence tampered
+5	POLICY	allowlist entry incomplete or expired, trusted-keys file malformed, bad --fail-on
+64	USAGE	unknown argument, missing required argument, wrong input path'
+  if [ "$JSON" = 1 ]; then
+    printf '%s\n' "$rows" | jq -R -s --arg v "$TOOLKIT_VERSION" '{toolkit:$v, exit_codes:[split("\n")[] | select(length > 0) | split("\t") | {code:(.[0]|tonumber), name:.[1], meaning:.[2]}]}'
+  else
+    printf '%s\n' "$rows" | awk -F'\t' '{printf "%-3s %-12s %s\n", $1, $2, $3}'
+  fi
 }
 
 case "${1:-help}" in
@@ -671,5 +809,6 @@ case "${1:-help}" in
   tools) tool_versions_json;;
   version) printf '%s\n' "$TOOLKIT_VERSION";;
   help|-h|--help) usage;;
-  *) usage; exit 64;;
+  exit-codes) shift; cmd_exit_codes "$@";;
+  *) usage; exit "$EX_USAGE";;
 esac

@@ -1,7 +1,7 @@
 # Reusable SBOM + CVE gate. Call it from any repo:
 #   jobs:
 #     gate:
-#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.2.1
+#       uses: ivanlin/sbom-cicd-toolkit/.github/workflows/scan.yml@v1.3.0
 #       with:
 #         name: my-project
 #         source: .
@@ -14,9 +14,10 @@
 # Pass toolkit_image explicitly: a tagged copy of this file cannot contain the digest of the image
 # built from that same tag, so the default below is only a placeholder that fails loudly.
 #
-# Enforcement: CI always ENFORCES — exit 2 (CVEs at or above fail_on) fails the job, and so does
-# exit 1 (tool / policy / signature-verification error, including an unreachable registry or
-# vulnerability DB). The sssf factory's LOCAL supply-chain node has its own, independent switch
+# Enforcement: CI always ENFORCES — every non-zero exit fails the job. Since 1.3.0 the code says
+# why (`sbomgate exit-codes`): 2 CVEs at or above fail_on · 3 an external resource (registry,
+# vulnerability DB) could not be got · 4 untrusted (signature / tools.lock / evidence) ·
+# 5 policy error (allowlist, trusted keys, threshold) · 64 usage · 1 anything else. The sssf factory's LOCAL supply-chain node has its own, independent switch
 # (defaults.supply_chain.enforcement: off | advisory | enforce, plus on_unavailable: block | degrade
 # under enforce). Local commits carrying a "Supply-Chain: advisory …", "… off" or "… degraded"
 # trailer were not gated on the developer machine — this job is where they get scanned for real.
@@ -43,7 +44,7 @@ on:
         default: false
       toolkit_image:
         type: string
-        # get it with: docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.2.1
+        # get it with: docker buildx imagetools inspect ghcr.io/ivanlin/sbom-cicd-toolkit:1.3.0
         default: "ghcr.io/ivanlin/sbom-cicd-toolkit@sha256:<fill-from-release>"
         description: "toolkit image pinned by digest (image@sha256:...); a tag-only ref is refused"
     outputs:
@@ -80,7 +81,7 @@ jobs:
       - name: Verify the toolkit image signature (trusted keys, no provider API)
         run: |
           docker run --rm "$TOOLKIT" verify-toolkit --image "$TOOLKIT" || {
-            echo "::error::toolkit image signature NOT verified against the trusted keys - refusing to scan (verification error = exit 1; do not 'fix' the code)"
+            echo "::error::toolkit image signature NOT verified against the trusted keys - refusing to scan (verify-toolkit exit 3 = registry unreachable, 4 = untrusted; do not 'fix' the code)"
             exit 1; }
       - id: scan
         name: SBOM (CycloneDX+SPDX) + CVE scan (grype, trivy) + gate
